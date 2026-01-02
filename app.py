@@ -3,20 +3,60 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 
-# --- 1. PRO TERMINAL LAYOUT ---
+# --- 1. MODERN LIGHT UI CONFIGURATION ---
 st.set_page_config(layout="wide", page_title="Wealth Architect Pro", page_icon="🏛️")
 
-# CSS to clean up the sidebar and buttons
+# Custom CSS for a Clean Light Professional Look
 st.markdown("""
     <style>
-    section[data-testid="stSidebar"] { width: 320px !important; background-color: #0e1117; }
-    .stButton>button { width: 100%; border-radius: 8px; height: 3em; background-color: #2e7d32; color: white; font-weight: bold; }
-    .stExpander { border: none !important; }
-    div[data-testid="stMetricValue"] { font-size: 22px; }
+    /* Main Background */
+    .stApp { background-color: #ffffff; }
+    
+    /* Sidebar Styling - Light & High Contrast */
+    section[data-testid="stSidebar"] {
+        background-color: #f0f2f6 !important; /* Light Grey-Blue */
+        border-right: 1px solid #e0e0e0;
+        width: 350px !important;
+    }
+    
+    /* Sidebar Text & Titles */
+    section[data-testid="stSidebar"] .stMarkdown h1, 
+    section[data-testid="stSidebar"] .stMarkdown h2, 
+    section[data-testid="stSidebar"] .stMarkdown h3 {
+        color: #1e293b !important;
+    }
+
+    /* Metric Card Styling */
+    div[data-testid="stMetricValue"] {
+        color: #2e7d32; /* Professional Green */
+        font-weight: 700;
+    }
+
+    /* Primary Execution Button */
+    .stButton>button {
+        width: 100%;
+        border-radius: 12px;
+        height: 3.5em;
+        background-color: #2563eb; /* Modern Blue */
+        color: white;
+        font-weight: bold;
+        border: none;
+        transition: 0.3s;
+    }
+    .stButton>button:hover {
+        background-color: #1d4ed8;
+        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2);
+    }
+
+    /* Clean Dataframe */
+    .stDataFrame {
+        border: 1px solid #f0f2f6;
+        border-radius: 12px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. LOGIC & BANDS (Hidden from UI) ---
+# --- 2. VALUATION ENGINE ---
 SECTOR_BANDS = {
     "Financial Services": {"type": "PB", "min": 1.0, "max": 4.0},
     "Technology": {"type": "PE", "min": 18, "max": 45},
@@ -41,7 +81,6 @@ def fetch_data(symbol):
         return t.info or {}, t.history(period="2y")
     except: return {}, None
 
-# --- 3. THE ANALYTIC ENGINE ---
 def analyze_stock(symbol, mos_pct, ttm_h, coe, g):
     info, hist = fetch_data(symbol)
     if hist is None or hist.empty or len(hist) < 200: return None
@@ -53,7 +92,6 @@ def analyze_stock(symbol, mos_pct, ttm_h, coe, g):
     sector = info.get("sector") or infer_sector(info.get("industry"))
     cfg = SECTOR_BANDS.get(sector, SECTOR_BANDS["Default"])
     
-    # Valuation Logic
     fair_val = None
     if cfg["type"] == "PB":
         book = info.get("bookValue")
@@ -69,7 +107,6 @@ def analyze_stock(symbol, mos_pct, ttm_h, coe, g):
     if not fair_val: return None
     mos_price = fair_val * (1 - mos_pct/100)
     
-    # Simple Recommendation
     if ltp <= mos_price and momentum == "Bullish": rec = "✅ Strong Buy"
     elif ltp <= fair_val: rec = "🟡 Hold"
     else: rec = "🔴 Overvalued"
@@ -77,66 +114,72 @@ def analyze_stock(symbol, mos_pct, ttm_h, coe, g):
     return {"Ticker": symbol, "Sector": sector, "LTP": round(ltp, 2), "Fair Price": round(fair_val, 2), 
             "MoS Buy": round(mos_price, 2), "Momentum": momentum, "Recommendation": rec}
 
-# --- 4. THE CLEAN UI ---
+# --- 3. UI LAYOUT (LIGHT THEME) ---
 
-# Sidebar Header & Grouping
 with st.sidebar:
-    st.title("⚙️ Parameters")
-    st.markdown("---")
+    st.title("⚙️ Engine Controls")
+    st.markdown("Adjust your global valuation filters below.")
+    st.write("")
     
-    with st.expander("🛡️ Valuation Margins", expanded=True):
-        mos = st.slider("Margin of Safety %", 5, 40, 20)
-        ttm_h = st.slider("TTM Haircut", 0.5, 1.0, 0.85)
+    with st.expander("🛡️ Margin of Safety", expanded=True):
+        mos = st.slider("Target MoS %", 5, 40, 20, help="Discount from Fair Value for a 'Strong Buy'")
+        ttm_h = st.slider("TTM EPS Haircut", 0.5, 1.0, 0.85, help="Reduction in PE multiple when using past earnings")
 
-    with st.expander("📈 Bank P/B Inputs", expanded=False):
+    with st.expander("📈 Bank Valuation (P/B)", expanded=False):
         coe = st.slider("Cost of Equity", 0.10, 0.20, 0.14)
         g_rate = st.slider("Long-term Growth", 0.03, 0.10, 0.06)
 
-    st.markdown("---")
-    st.caption("v3.5 Build | Data: Yahoo Finance")
+    st.divider()
+    st.caption("Status: All Systems Nominal")
 
-# Main Area
+# Main Display
 st.title("🏛️ Wealth Architect Pro")
-st.markdown("#### Institutional Portfolio Intelligence")
+st.markdown("#### Strategic Portfolio Intelligence Terminal")
+st.write("")
 
-# 1. Direct Upload
-uploaded_file = st.file_uploader("Upload your portfolio CSV", type=["csv"], label_visibility="collapsed")
+# Single, clean upload area
+uploaded_file = st.file_uploader("Upload PortfolioImportTemplate.csv", type=["csv"], label_visibility="collapsed")
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
     df.columns = [c.lower().strip() for c in df.columns]
     
-    # 2. Key Metrics Row
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Holdings Detected", len(df))
-    m2.metric("Target MoS", f"{mos}%")
-    m3.metric("Analysis Mode", "Sector-Aware")
+    # Dashboard Summary
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Holdings Detected", len(df))
+    c2.metric("Valuation Logic", "Sector-Aware")
+    c3.metric("Safety Buffer", f"{mos}%")
 
-    # 3. Big Action Button
-    if st.button("🚀 ANALYZE PORTFOLIO"):
-        results = []
-        # Auto-detect Ticker column
+    st.write("")
+    # Big primary action button
+    if st.button("🚀 EXECUTE MULTI-FACTOR ANALYSIS"):
+        # Auto-detect column
         ticker_col = next((c for c in df.columns if "symbol" in c or "ticker" in c), None)
         
         if not ticker_col:
-            st.error("Could not find a 'Stock Symbol' column in your CSV.")
+            st.error("Error: Could not find a 'Stock Symbol' column in your file.")
         else:
+            results = []
             prog = st.progress(0)
             status = st.empty()
+            
             for i, row in df.iterrows():
                 sym = str(row[ticker_col]).strip()
                 if "." not in sym: sym += ".NS"
-                status.text(f"Processing: {sym}")
+                status.text(f"Analyzing: {sym}...")
                 res = analyze_stock(sym, mos, ttm_h, coe, g_rate)
                 if res: results.append(res)
                 prog.progress((i+1)/len(df))
             
             status.empty()
             if results:
-                st.subheader("📋 Analysis Results")
+                st.write("---")
+                st.subheader("📋 Institutional Valuation Report")
                 res_df = pd.DataFrame(results)
                 st.dataframe(res_df, use_container_width=True, hide_index=True)
-                st.download_button("📥 Download Excel Report", res_df.to_csv(index=False), "Analysis.csv")
-
+                
+                # Download
+                csv = res_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Export Analysis to CSV", csv, "Wealth_Report.csv", "text/csv")
 else:
-    st.info("💡 Please upload your PortfolioImportTemplate.csv to begin.")
+    st.info("👋 Welcome. Please upload your Portfolio CSV above to begin the automated valuation process.")
