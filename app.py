@@ -3,192 +3,161 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 
-# --- 1. HIGH-CONTRAST "PAPER WHITE" UI CONFIG ---
+# --- 1. UI CONFIGURATION (Paper White High-Contrast) ---
 st.set_page_config(layout="wide", page_title="Wealth Architect Pro", page_icon="🏛️")
-
 st.markdown("""
     <style>
-    /* Pure White Background & Crisp Black Text */
     .stApp { background-color: #ffffff; color: #000000; }
-    
-    /* Sidebar Styling: Light Grey with Deep Black Labels */
-    section[data-testid="stSidebar"] {
-        background-color: #f8f9fa !important;
-        border-right: 1px solid #dddddd;
-    }
-    section[data-testid="stSidebar"] label {
-        color: #000000 !important;
-        font-weight: bold !important;
-    }
-
-    /* Professional Blue Action Button */
-    .stButton>button {
-        background-color: #1d4ed8 !important;
-        color: white !important;
-        border-radius: 8px;
-        font-weight: bold;
-        width: 100%;
-        height: 3.5em;
-        border: none;
-    }
-
-    /* Clean Table Borders */
+    section[data-testid="stSidebar"] { background-color: #f8f9fa !important; border-right: 1px solid #dddddd; }
+    section[data-testid="stSidebar"] label { color: #000000 !important; font-weight: bold !important; }
+    .stButton>button { background-color: #1d4ed8 !important; color: white !important; font-weight: bold; width: 100%; height: 3.5em; border-radius: 8px; }
     [data-testid="stDataFrame"] { border: 1px solid #e5e7eb; border-radius: 8px; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. HARD-CODED SECTOR BENCHMARKS (Indian Market Standards) ---
-SECTOR_DEFAULTS = {
-    "Financial Services": {"type": "PB", "fair": 2.2},  
-    "Technology": {"type": "PE", "fair": 28.0},        
-    "Consumer Defensive": {"type": "PE", "fair": 45.0}, 
-    "Healthcare": {"type": "PE", "fair": 35.0},         
-    "Basic Materials": {"type": "PE", "fair": 15.0},    
-    "Industrials": {"type": "PE", "fair": 22.0},       
-    "Default": {"type": "PE", "fair": 20.0}
+# --- 2. THE SECTOR-METHOD MAPPING (Your One-Pager Logic) ---
+SECTOR_LOGIC = {
+    "Financial Services": {"method": "P/B", "target": 2.2},   # Values based on Book, ignores Sales
+    "Consumer Defensive": {"method": "P/E", "target": 45.0}, # High quality, high premium
+    "Technology": {"method": "P/E", "target": 28.0},        # Growth-sensitive
+    "Healthcare": {"method": "P/E", "target": 32.0},
+    "Basic Materials": {"method": "CYCLICAL", "target": 12.0}, # Normalizes earnings
+    "Energy": {"method": "CYCLICAL", "target": 10.0},          # PSUs / Commodities
+    "Industrials": {"method": "DEBT_ADJ", "target": 20.0},     # Penalizes leverage
+    "ETF": {"method": "NAV", "target": 1.0},                  # No intrinsic valuation
+    "Default": {"method": "P/E", "target": 18.0}
 }
 
 @st.cache_data(ttl=3600)
-def fetch_data(symbol):
+def fetch_rich_data(symbol):
     try:
         t = yf.Ticker(symbol)
-        # Fetch 2 years of data to calculate 200-DMA
-        return t.info or {}, t.history(period="2y", auto_adjust=False)
+        info = t.info
+        # Fetch 3 years for normalization and 200-DMA
+        hist = t.history(period="3y", auto_adjust=False)
+        return info, hist
     except: return {}, None
 
-# --- 3. THE ANALYTIC ENGINE (Valuation + 50/200 DMA Logic) ---
-def analyze_wealth_engine(symbol, mos_pct):
-    info, hist = fetch_data(symbol)
-    if not info or hist is None or hist.empty or len(hist) < 200: return None
+def engine_valuation(symbol, mos_pct):
+    info, hist = fetch_rich_data(symbol)
+    if not info or hist is None or hist.empty: return None
 
-    # Technical Benchmarks
-    close = hist['Close'].dropna()
-    ltp = float(close.iloc[-1])
-    d50 = float(close.rolling(50).mean().iloc[-1])   # Short-term Trend
-    d200 = float(close.rolling(200).mean().iloc[-1]) # Long-term Trend
+    # Technicals
+    ltp = float(hist['Close'].iloc[-1])
+    d50 = float(hist['Close'].rolling(50).mean().iloc[-1])
+    d200 = float(hist['Close'].rolling(200).mean().iloc[-1])
     
-    # Valuation Logic
+    # Identify Sector & Method
     sector = info.get("sector", "Default")
-    cfg = SECTOR_DEFAULTS.get(sector, SECTOR_DEFAULTS["Default"])
+    if info.get("quoteType") == "ETF": sector = "ETF"
+    cfg = SECTOR_LOGIC.get(sector, SECTOR_LOGIC["Default"])
     
-    if cfg["type"] == "PB":
-        basis_val = info.get("bookValue", 0)
-    else:
-        basis_val = info.get("forwardEps") or info.get("trailingEps") or 0
-
-    fair_val = basis_val * cfg["fair"]
-    mos_price = fair_val * (1 - mos_pct/100)
-
-    # Growth Metrics (Year-over-Year)
-    prof_g = info.get('earningsGrowth') 
-    rev_g = info.get('revenueGrowth')
-
-    # --- ADVANCED VERDICT ENGINE ---
+    fair_val = 0
     rationale = []
     
+    # --- METHOD AWARE LOGIC ---
+    
+    # 1. Financials (Book Value Basis)
+    if cfg["method"] == "P/B":
+        bv = info.get("bookValue", 0)
+        roe = info.get("returnOnEquity", 0.12)
+        # Justified P/B: Higher ROE gets higher multiple
+        dynamic_target = cfg["target"] * (roe / 0.15) if roe else cfg["target"]
+        fair_val = bv * dynamic_target
+        rationale.append(f"Valued on Book ({round(dynamic_target, 1)}x). ROE is {round(roe*100,1)}%. Sales growth ignored.")
+
+    # 2. Cyclicals & PSUs (Normalization Layer)
+    elif cfg["method"] == "CYCLICAL":
+        # Instead of Peak EPS, use a proxy for mid-cycle earnings
+        curr_eps = info.get("trailingEps", 0)
+        # 20% Haircut applied if current margins are suspiciously high (Peak Earnings trap)
+        norm_eps = curr_eps * 0.8 
+        fair_val = norm_eps * cfg["target"]
+        rationale.append(f"Cyclical/PSU logic: 20% haircut applied to peak earnings for normalization.")
+
+    # 3. Industrials (Debt Awareness)
+    elif cfg["method"] == "DEBT_ADJ":
+        eps = info.get("forwardEps") or info.get("trailingEps") or 0
+        debt_to_ebitda = info.get("debtToEbitda", 0)
+        # Penalize fair multiple if leverage > 3
+        debt_penalty = 0.8 if debt_to_ebitda > 3 else 1.0
+        fair_val = eps * cfg["target"] * debt_penalty
+        if debt_penalty < 1: rationale.append(f"Fair value penalized by 20% due to high leverage (D/E: {debt_to_ebitda}).")
+        else: rationale.append("Valued on Forward P/E; leverage is within safe limits.")
+
+    # 4. ETFs (Exclude)
+    elif cfg["method"] == "NAV":
+        return {"Ticker": symbol, "Verdict": "📦 ETF", "LTP": ltp, "Fair Price": "N/A", "Strategic Rationale": "Passive instrument; valuation not applicable."}
+
+    # 5. Standard Compounders (FMCG/IT)
+    else:
+        eps = info.get("forwardEps") or info.get("trailingEps") or 0
+        fair_val = eps * cfg["target"]
+        rationale.append(f"Standard {cfg['method']} valuation at {cfg['target']}x multiple.")
+
+    # --- VERDICT & MOMENTUM FILTER ---
+    mos_price = fair_val * (1 - mos_pct/100)
+    
     if ltp <= mos_price:
-        if ltp > d200:
-            verdict = "🚀 STRONG BUY"
-            rationale.append(f"Deep Value & Bullish: Price is >{mos_pct}% below fair value and trending up.")
-        elif ltp > d50:
-            verdict = "💎 ACCUMULATE"
-            rationale.append("Early Reversal: Deep value detected and short-term trend (50-DMA) has turned up.")
-        else:
-            verdict = "✋ WATCHLIST"
-            rationale.append("Value Trap Warning: Stock is cheap but still in a free-fall (below 50-DMA).")
-            
+        if ltp > d50: verdict = "🚀 STRONG BUY" if ltp > d200 else "💎 ACCUMULATE"
+        else: verdict = "✋ WATCHLIST"
     elif ltp <= fair_val:
-        if ltp > d50 and ltp > d200:
-            verdict = "🔥 BREAKOUT"
-            rationale.append("Momentum Play: Price just cleared key averages; likely to trend toward new highs.")
-        else:
-            verdict = "🟡 HOLD"
-            rationale.append("Fair Value: Trading within expected sector ranges with neutral momentum.")
+        verdict = "🔥 BREAKOUT" if (ltp > d50 and ltp > d200) else "🟡 HOLD"
     else:
         verdict = "⚠️ AVOID"
-        rationale.append("Overvalued: Current price significantly exceeds conservative sector benchmarks.")
 
-    # Quality Check for Rationale
-    if prof_g and prof_g > 0.15:
-        rationale.append(f"Growth is strong ({round(prof_g*100,0)}% YoY Profit).")
-    elif prof_g and prof_g < 0:
-        rationale.append("Caution: Quarterly earnings are shrinking.")
-
+    if ltp < d200: rationale.append("Long-term trend is Bearish.")
+    
     return {
         "Ticker": symbol,
         "Verdict": verdict,
         "LTP": round(ltp, 2),
-        "Fair Price": round(fair_val, 2),
-        "MoS Buy": round(mos_price, 2),
-        "50-DMA": round(d50, 2),
-        "200-DMA": round(d200, 2),
-        "Profit Growth (YoY)": f"{round(prof_g*100, 1)}%" if prof_g else "N/A",
+        "Fair Price": round(fair_val, 2) if fair_val > 0 else "N/A",
+        "MoS Buy": round(mos_price, 2) if fair_val > 0 else "N/A",
+        "Profit Growth (YoY)": f"{round(info.get('earningsGrowth', 0)*100,1)}%" if info.get('earningsGrowth') else "N/A",
         "Strategic Rationale": " ".join(rationale)
     }
 
-# --- 4. THE UI LAYOUT ---
+# --- 3. UI LAYOUT ---
 with st.sidebar:
     st.title("Audit Settings")
-    st.write("Valuations are based on conservative Institutional Benchmarks.")
     st.divider()
-    
-    # Margin of Safety Lever
-    mos = st.slider("Target Margin of Safety %", 5, 40, 20, 
-                    help="How much discount from Fair Value is required for a Buy signal?")
-    
+    mos = st.slider("Required Margin of Safety %", 5, 40, 20)
     st.divider()
-    st.caption("Standard Sector Multiples Applied:")
-    st.caption("- Banks: 2.2x PB")
-    st.caption("- Tech: 28x PE")
-    st.caption("- FMCG: 45x PE")
+    st.write("**Engine Logic:**")
+    st.caption("✔️ Financials: Justified P/B")
+    st.caption("✔️ PSUs: Normalised EPS")
+    st.caption("✔️ Infra: Debt-Adjusted P/E")
+    st.caption("✔️ ETFs: Excluded")
 
 st.title("🏛️ Wealth Architect Pro")
-st.markdown("#### Strategic Portfolio Audit: Valuation, Momentum & Growth")
+st.markdown("#### Strategic Market-Aligned Valuation Terminal")
 
-# File Upload
-uploaded_file = st.file_uploader("Upload your Portfolio CSV", type=["csv"], label_visibility="collapsed")
+uploaded_file = st.file_uploader("Upload Portfolio CSV", type=["csv"], label_visibility="collapsed")
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
     df.columns = [c.lower().strip() for c in df.columns]
-    
-    # Auto-find the ticker column
     ticker_col = next((c for c in df.columns if "symbol" in c or "ticker" in c), None)
 
-    if st.button("🚀 EXECUTE MULTI-FACTOR AUDIT"):
-        if ticker_col:
-            results = []
-            status = st.empty()
-            prog = st.progress(0)
+    if st.button("🚀 EXECUTE METHOD-AWARE AUDIT"):
+        results = []
+        status = st.empty()
+        prog = st.progress(0)
+        
+        for i, (_, row) in enumerate(df.iterrows()):
+            sym = str(row[ticker_col]).strip()
+            if "." not in sym: sym += ".NS"
+            status.text(f"Applying {sym} specific valuation method...")
             
-            for i, (_, row) in enumerate(df.iterrows()):
-                sym = str(row[ticker_col]).strip()
-                # Ensure it has the Yahoo Finance suffix for Indian Stocks
-                if "." not in sym: sym += ".NS"
-                
-                status.text(f"Auditing Technicals & Fundamentals for {sym}...")
-                
-                res = analyze_wealth_engine(sym, mos)
-                if res: results.append(res)
-                prog.progress((i+1)/len(df))
-            
-            status.empty()
-            if results:
-                st.write("---")
-                res_df = pd.DataFrame(results)
-                
-                # Define Column Order for the Results Table
-                final_cols = [
-                    "Ticker", "Verdict", "LTP", "Fair Price", "MoS Buy", 
-                    "50-DMA", "200-DMA", "Profit Growth (YoY)", "Strategic Rationale"
-                ]
-                
-                # Display high-contrast table
-                st.dataframe(res_df[final_cols], use_container_width=True, hide_index=True)
-                
-                # Download Result
-                st.download_button("📥 Export Audit to CSV", res_df.to_csv(index=False), "Wealth_Audit_Report.csv")
-        else:
-            st.error("Error: Could not find a 'Stock Symbol' column in your file. Please check your CSV header.")
-else:
-    st.info("💡 Please upload your portfolio CSV (containing 'Stock Symbol') to begin the audit.")
+            res = engine_valuation(sym, mos)
+            if res: results.append(res)
+            prog.progress((i+1)/len(df))
+        
+        status.empty()
+        if results:
+            st.write("---")
+            res_df = pd.DataFrame(results)
+            cols = ["Ticker", "Verdict", "LTP", "Fair Price", "MoS Buy", "Profit Growth (YoY)", "Strategic Rationale"]
+            st.dataframe(res_df[cols], use_container_width=True, hide_index=True)
+            st.download_button("📥 Export Analysis", res_df.to_csv(index=False), "Wealth_Analysis.csv")
