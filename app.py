@@ -506,8 +506,7 @@ if uploaded_file:
             mime="text/csv"
         )
 
-st.markdown(
-    "### How to run (local)\n"
+st.markdown("### How to run (local)\n"
     "1) Install:\n"
     "```bash\n"
     "pip install streamlit yfinance pandas numpy openpyxl\n"
