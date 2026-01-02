@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 import yfinance as yf
 
@@ -53,14 +52,12 @@ COL_MOM = "Momentum"
 COL_REC = "Recommendation"
 COL_REASON = "Reason"
 
-# Group headers like your screenshot
 GROUP_TECH = "Technicals"
 GROUP_FUND = "Fundamentals"
 GROUP_VAL = "Valuation"
 GROUP_FINAL = "Final"
-GROUP_LEFT = ""  # left side (Company, LTP)
+GROUP_LEFT = ""
 
-# MultiIndex column structure (top row groups + second row exact names)
 DISPLAY_COLUMNS = pd.MultiIndex.from_tuples(
     [
         (GROUP_LEFT, COL_COMPANY),
@@ -86,7 +83,6 @@ DISPLAY_COLUMNS = pd.MultiIndex.from_tuples(
     ]
 )
 
-# For CSV download we keep single-level columns in the same sequence
 CSV_COLUMNS = [
     COL_COMPANY, COL_LTP,
     COL_50, COL_150, COL_200,
@@ -94,7 +90,6 @@ CSV_COLUMNS = [
     COL_VAL_PB, COL_VAL_FAIR, COL_VAL_MOS, COL_VAL_METHOD,
     COL_MOM, COL_REC, COL_REASON
 ]
-
 
 # =========================
 # SECTOR/VALUATION CONFIG
@@ -111,20 +106,9 @@ SECTOR_BANDS = {
     "Default": {"method": "P/E", "pe_min": 12.0, "pe_max": 28.0, "pe_mid": 18.0},
 }
 
-
 # =========================
 # HELPERS
 # =========================
-def _yahoo_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(
-        {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"
-        }
-    )
-    return s
-
-
 def _clean_nse_symbol(sym: str) -> str:
     sym = str(sym or "").strip().upper()
     if not sym:
@@ -146,10 +130,6 @@ def _safe_float(x):
         return x
     except Exception:
         return None
-
-
-def _na(x):
-    return "NA" if x is None else x
 
 
 def _cagr(a, b, years: float):
@@ -220,7 +200,7 @@ def _retry(fn, tries=2, base_sleep=0.6):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_prices_batch(tickers: list[str]):
-    session = _yahoo_session()
+    # IMPORTANT: Do NOT pass custom session (new yfinance requires curl_cffi internally)
     data = yf.download(
         tickers=tickers,
         period="2y",
@@ -229,7 +209,6 @@ def fetch_prices_batch(tickers: list[str]):
         auto_adjust=False,
         threads=True,
         progress=False,
-        session=session,
     )
     return data
 
@@ -258,8 +237,8 @@ def fetch_fundamentals_one(ticker: str):
     - ROE, PB from info if present
     - 3Y sales/profit growth and ROCE only if annual statements are available (often missing for NSE).
     """
-    session = _yahoo_session()
-    t = yf.Ticker(ticker, session=session)
+    # IMPORTANT: Do NOT pass custom session; let yfinance manage it.
+    t = yf.Ticker(ticker)
 
     info = _retry(lambda: t.info, tries=2) or {}
     sector = info.get("sector")
@@ -269,34 +248,31 @@ def fetch_fundamentals_one(ticker: str):
     roe = _safe_float(info.get("returnOnEquity"))
     roe_pct = (roe * 100.0) if roe is not None else None
 
-    # statements (often missing for NSE)
-    income = None
-    balance = None
-
-    def _get_income():
-        inc = getattr(t, "get_income_stmt", None)
-        if callable(inc):
-            return inc(freq="yearly")
-        if hasattr(t, "income_stmt"):
-            return t.income_stmt
-        return t.financials
-
-    def _get_balance():
-        bs = getattr(t, "get_balance_sheet", None)
-        if callable(bs):
-            return bs(freq="yearly")
-        if hasattr(t, "balance_sheet"):
-            return t.balance_sheet
-        return t.balance_sheet
-
-    income = _retry(_get_income, tries=2)
-    balance = _retry(_get_balance, tries=2)
-
     sales_cagr = None
     profit_cagr = None
     roce_pct = None
 
+    # statements (often missing for NSE)
     try:
+        def _get_income():
+            inc = getattr(t, "get_income_stmt", None)
+            if callable(inc):
+                return inc(freq="yearly")
+            if hasattr(t, "income_stmt"):
+                return t.income_stmt
+            return t.financials
+
+        def _get_balance():
+            bs = getattr(t, "get_balance_sheet", None)
+            if callable(bs):
+                return bs(freq="yearly")
+            if hasattr(t, "balance_sheet"):
+                return t.balance_sheet
+            return t.balance_sheet
+
+        income = _retry(_get_income, tries=2)
+        balance = _retry(_get_balance, tries=2)
+
         if isinstance(income, pd.DataFrame) and not income.empty:
             cols_sorted = sorted(list(income.columns))
             income2 = income[cols_sorted]
@@ -329,15 +305,15 @@ def fetch_fundamentals_one(ticker: str):
                 bs2 = balance[bcols]
 
                 ta = None
-                for r in ["Total Assets", "TotalAssets"]:
-                    if r in bs2.index:
-                        ta = bs2.loc[r]
+                for rname in ["Total Assets", "TotalAssets"]:
+                    if rname in bs2.index:
+                        ta = bs2.loc[rname]
                         break
 
                 cl = None
-                for r in ["Total Current Liabilities", "Current Liabilities", "TotalCurrentLiabilities"]:
-                    if r in bs2.index:
-                        cl = bs2.loc[r]
+                for rname in ["Total Current Liabilities", "Current Liabilities", "TotalCurrentLiabilities"]:
+                    if rname in bs2.index:
+                        cl = bs2.loc[rname]
                         break
 
                 if ta is not None and cl is not None:
@@ -456,7 +432,10 @@ with st.sidebar:
     st.header("Settings")
     mos = st.slider("Margin of Safety %", 5, 40, 20, 1)
     workers = st.slider("Speed (parallel workers)", 2, 12, 4, 1)
-    st.markdown('<div class="small-note">If it stalls or shows NA for prices, reduce workers (Yahoo throttling).</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="small-note">If it stalls or shows NA for prices, reduce workers (Yahoo throttling).</div>',
+        unsafe_allow_html=True,
+    )
 
 uploaded = st.file_uploader("Upload Portfolio CSV", type=["csv"])
 
@@ -509,7 +488,6 @@ if uploaded:
             val_pb, val_fair, val_mos, val_method = compute_valuation(fund, mos)
             reco, reason = final_reco(ltp, d50, d150, d200, val_fair, val_mos, mom)
 
-            # Single-level row for CSV + later conversion to MultiIndex
             row = {
                 COL_COMPANY: company_map.get(t, t),
                 COL_LTP: "NA" if ltp is None else round(ltp, 2),
@@ -547,14 +525,12 @@ if uploaded:
         status.empty()
         prog.empty()
 
-        # Build result dataframe (single level)
         res = pd.DataFrame(results_rows)
         for c in CSV_COLUMNS:
             if c not in res.columns:
                 res[c] = "NA"
         res = res[CSV_COLUMNS]
 
-        # Convert to MultiIndex for display with group headers
         display = pd.DataFrame(columns=DISPLAY_COLUMNS)
         for (grp, col) in DISPLAY_COLUMNS:
             display[(grp, col)] = res[col]
@@ -563,8 +539,13 @@ if uploaded:
         st.dataframe(display, use_container_width=True, hide_index=True)
 
         csv_bytes = res.to_csv(index=False).encode("utf-8")
-        st.download_button("Download results as CSV", data=csv_bytes, file_name="wealth_architect_results.csv", mime="text/csv")
+        st.download_button(
+            "Download results as CSV",
+            data=csv_bytes,
+            file_name="wealth_architect_results.csv",
+            mime="text/csv",
+        )
 
-        st.caption("Note: For NSE, Yahoo often lacks full financial statements → Sales/Profit 3Y + ROCE may show NA. Prices/DMAs should still populate.")
+        st.caption("Note: For NSE, Yahoo often lacks full statements → Sales/Profit 3Y + ROCE may show NA. Prices/DMAs should still populate.")
 else:
     st.info("Upload your PortfolioImportTemplate.csv to run.")
