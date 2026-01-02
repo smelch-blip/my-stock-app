@@ -507,8 +507,14 @@ if uploaded_file:
         )
 
 st.markdown(
-    """
-### How to run (local)
-1) Install:
-```bash
-pip install streamlit yfinance pandas numpy openpyxl
+    "### How to run (local)\n"
+    "1) Install:\n"
+    "```bash\n"
+    "pip install streamlit yfinance pandas numpy openpyxl\n"
+    "```\n"
+    "2) Run:\n"
+    "```bash\n"
+    "streamlit run app.py\n"
+    "```\n"
+    "\n"
+    "**Tip:** For NSE symbols, use `INFY` / `TCS` etc. The app auto-appends `.NS` by default.\n")
