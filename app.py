@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 
-# --- 1. HIGH-CONTRAST "PAPER WHITE" UI ---
+# --- 1. CLEAN HIGH-CONTRAST UI ---
 st.set_page_config(layout="wide", page_title="Wealth Architect Pro", page_icon="🏛️")
 
 st.markdown("""
@@ -17,7 +17,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. HARD-CODED INSTITUTIONAL BENCHMARKS ---
+# --- 2. HARD-CODED SECTOR BENCHMARKS ---
 SECTOR_DEFAULTS = {
     "Financial Services": {"type": "PB", "fair": 2.2},  
     "Technology": {"type": "PE", "fair": 28.0},        
@@ -39,13 +39,13 @@ def analyze_wealth_engine(symbol, mos_pct):
     info, hist = fetch_data(symbol)
     if not info or hist is None or hist.empty: return None
 
-    # 1. Technicals
+    # Technicals
     close = hist['Close'].dropna()
     ltp = float(close.iloc[-1])
     d200 = float(close.rolling(200).mean().iloc[-1])
     momentum = "Bullish" if ltp > d200 else "Bearish"
 
-    # 2. Valuation Logic
+    # Valuation Logic
     sector = info.get("sector", "Default")
     cfg = SECTOR_DEFAULTS.get(sector, SECTOR_DEFAULTS["Default"])
     
@@ -57,29 +57,35 @@ def analyze_wealth_engine(symbol, mos_pct):
     fair_val = basis_val * cfg["fair"]
     mos_price = fair_val * (1 - mos_pct/100)
 
-    # 3. Growth Metrics (YoY = Year over Year for the most recent quarter)
+    # Growth Metrics (YoY)
     rev_g = info.get('revenueGrowth')
-    prof_g = info.get('earningsGrowth') # YoY change in quarterly profits
+    prof_g = info.get('earningsGrowth') 
 
-    # 4. Rationale & Verdict
+    # Building the Strategic Rationale (The "Text Box" Logic)
     rationale = []
+    
+    # 1. Valuation Rationale
     if ltp <= mos_price:
         verdict = "🚀 BUY"
-        rationale.append(f"Undervalued: Trading at >{mos_pct}% discount to sector fair value.")
+        rationale.append(f"Stock is highly attractive, trading at a {mos_pct}%+ discount to its fair {cfg['type']}.")
     elif ltp <= fair_val:
         verdict = "✋ HOLD"
-        rationale.append("Fair Value: Trading within reasonable sector multiples.")
+        rationale.append(f"Fairly valued. Price is aligned with sector {cfg['type']} benchmarks.")
     else:
         verdict = "⚠️ AVOID"
-        rationale.append("Expensive: Price exceeds conservative sector benchmarks.")
+        rationale.append(f"Expensive. Current price exceeds historical fair {cfg['type']} by a wide margin.")
 
+    # 2. Performance Rationale
     if prof_g and prof_g > 0.15:
-        rationale.append("Strong bottom-line growth.")
+        rationale.append(f"Business health is strong with {round(prof_g*100,0)}% YoY profit growth.")
     elif prof_g and prof_g < 0:
-        rationale.append("Declining profitability.")
+        rationale.append("Warning: Quarterly profitability is declining compared to last year.")
 
+    # 3. Technical Rationale
     if momentum == "Bearish":
-        rationale.append("Negative price trend (Below 200 DMA).")
+        rationale.append("The technical trend is weak (trading below the 200-day average).")
+    else:
+        rationale.append("Positive momentum remains intact.")
 
     return {
         "Ticker": symbol,
@@ -90,21 +96,19 @@ def analyze_wealth_engine(symbol, mos_pct):
         "Momentum": momentum,
         "Sales Growth (YoY)": f"{round(rev_g*100, 1)}%" if rev_g else "N/A",
         "Profit Growth (YoY)": f"{round(prof_g*100, 1)}%" if prof_g else "N/A",
-        "Strategic Rationale": " ".join(rationale)
+        "Strategic Rationale": " ".join(rationale) # This creates the readable text block
     }
 
-# --- 3. THE UI ---
+# --- 3. UI LAYOUT ---
 with st.sidebar:
     st.title("Audit Settings")
-    st.write("Valuation benchmarks are hard-coded for conservative Indian market standards.")
     st.divider()
     mos = st.slider("Required Margin of Safety %", 5, 40, 20)
     st.divider()
-    st.caption("Standard Sector Multiples Applied:")
-    st.caption("- Banks: 2.2x PB | IT: 28x PE | FMCG: 45x PE")
+    st.caption("Configuration: Indian Market Blue-Chip Standards")
 
 st.title("🏛️ Wealth Architect Pro")
-st.write("Automated Fundamental & Technical Audit")
+st.write("Upload your portfolio to generate a fundamental rationale for every holding.")
 
 uploaded_file = st.file_uploader("Upload Portfolio CSV", type=["csv"], label_visibility="collapsed")
 
@@ -113,7 +117,7 @@ if uploaded_file:
     df.columns = [c.lower().strip() for c in df.columns]
     ticker_col = next((c for c in df.columns if "symbol" in c or "ticker" in c), None)
 
-    if st.button("🚀 RUN FULL AUDIT"):
+    if st.button("🚀 EXECUTE PORTFOLIO AUDIT"):
         if ticker_col:
             results = []
             status = st.empty()
@@ -122,7 +126,7 @@ if uploaded_file:
             for i, (_, row) in enumerate(df.iterrows()):
                 sym = str(row[ticker_col]).strip()
                 if "." not in sym: sym += ".NS"
-                status.text(f"Analyzing {sym}...")
+                status.text(f"Auditing {sym}...")
                 
                 res = analyze_wealth_engine(sym, mos)
                 if res: results.append(res)
@@ -137,6 +141,6 @@ if uploaded_file:
                 cols = ["Ticker", "Verdict", "LTP", "Fair Price", "MoS Buy", "Momentum", "Sales Growth (YoY)", "Profit Growth (YoY)", "Strategic Rationale"]
                 st.dataframe(res_df[cols], use_container_width=True, hide_index=True)
                 
-                st.download_button("📥 Download Report", res_df.to_csv(index=False), "Market_Audit.csv")
+                st.download_button("📥 Export Rationale Report", res_df.to_csv(index=False), "Wealth_Rationale_Audit.csv")
         else:
-            st.error("Could not find a 'Stock Symbol' column.")
+            st.error("Please ensure your CSV has a column named 'stock symbol'.")
