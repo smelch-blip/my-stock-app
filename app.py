@@ -3,112 +3,140 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 
-# --- 1. CLEAN TERMINAL UI ---
+# --- 1. HIGH-CONTRAST "PAPER WHITE" UI ---
 st.set_page_config(layout="wide", page_title="Wealth Architect Pro", page_icon="🏛️")
 
 st.markdown("""
     <style>
     .stApp { background-color: #ffffff; color: #000000; }
     section[data-testid="stSidebar"] { background-color: #f8f9fa !important; border-right: 1px solid #dddddd; }
-    section[data-testid="stSidebar"] label { color: #000000 !important; font-weight: bold !important; font-size: 1.1rem !important; }
-    .stButton>button { background-color: #2563eb !important; color: white !important; font-weight: bold; width: 100%; height: 3.5em; border-radius: 10px; }
-    div[data-testid="stMetricValue"] { color: #1e40af !important; }
+    section[data-testid="stSidebar"] label { color: #000000 !important; font-weight: bold !important; }
+    .stButton>button { background-color: #1d4ed8 !important; color: white !important; border-radius: 8px; font-weight: bold; width: 100%; height: 3.5em; }
+    div[data-testid="stMetricValue"] { color: #1e40af !important; font-weight: 700; }
+    [data-testid="stDataFrame"] { border: 1px solid #e5e7eb; border-radius: 8px; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. HARD-CODED LOGIC (Institutional Defaults) ---
-# We are hard-coding conservative sector multiples here
-DEFAULTS = {
-    "Financial Services": {"type": "PB", "fair": 2.2},  # Quality Indian Banks trade ~2x Book
-    "Technology": {"type": "PE", "fair": 30.0},        # Growth IT average
-    "Consumer Defensive": {"type": "PE", "fair": 45.0}, # FMCG Premium
-    "Industrials": {"type": "PE", "fair": 25.0},       # Infrastructure/Capital Goods
-    "Default": {"type": "PE", "fair": 22.0}
+# --- 2. HARD-CODED INSTITUTIONAL BENCHMARKS ---
+SECTOR_DEFAULTS = {
+    "Financial Services": {"type": "PB", "fair": 2.2},  
+    "Technology": {"type": "PE", "fair": 28.0},        
+    "Consumer Defensive": {"type": "PE", "fair": 45.0}, 
+    "Healthcare": {"type": "PE", "fair": 35.0},         
+    "Basic Materials": {"type": "PE", "fair": 15.0},    
+    "Industrials": {"type": "PE", "fair": 22.0},       
+    "Default": {"type": "PE", "fair": 20.0}
 }
 
 @st.cache_data(ttl=3600)
 def fetch_data(symbol):
     try:
         t = yf.Ticker(symbol)
-        return t.info or {}, t.history(period="2y")
+        return t.info or {}, t.history(period="2y", auto_adjust=False)
     except: return {}, None
 
-def quick_analyze(symbol, mos_pct, row_data):
+def analyze_wealth_engine(symbol, mos_pct):
     info, hist = fetch_data(symbol)
     if not info or hist is None or hist.empty: return None
 
-    ltp = hist['Close'].iloc[-1]
-    d200 = hist['Close'].rolling(200).mean().iloc[-1]
-    
-    # Valuation Logic
+    # 1. Technicals
+    close = hist['Close'].dropna()
+    ltp = float(close.iloc[-1])
+    d200 = float(close.rolling(200).mean().iloc[-1])
+    momentum = "Bullish" if ltp > d200 else "Bearish"
+
+    # 2. Valuation Logic
     sector = info.get("sector", "Default")
-    cfg = DEFAULTS.get(sector, DEFAULTS["Default"])
+    cfg = SECTOR_DEFAULTS.get(sector, SECTOR_DEFAULTS["Default"])
     
     if cfg["type"] == "PB":
-        val_basis = info.get("bookValue", 0)
+        basis_val = info.get("bookValue", 0)
     else:
-        val_basis = info.get("forwardEps") or info.get("trailingEps") or 0
-        
-    fair_val = val_basis * cfg["fair"]
+        basis_val = info.get("forwardEps") or info.get("trailingEps") or 0
+
+    fair_val = basis_val * cfg["fair"]
     mos_price = fair_val * (1 - mos_pct/100)
 
-    # Simple Verdict
-    if ltp <= mos_price and ltp > d200: verdict = "🚀 BUY (Strong)"
-    elif ltp <= fair_val: verdict = "✋ HOLD"
-    else: verdict = "⚠️ OVERVALUED"
+    # 3. Growth Metrics (YoY = Year over Year for the most recent quarter)
+    rev_g = info.get('revenueGrowth')
+    prof_g = info.get('earningsGrowth') # YoY change in quarterly profits
 
-    res = {
+    # 4. Rationale & Verdict
+    rationale = []
+    if ltp <= mos_price:
+        verdict = "🚀 BUY"
+        rationale.append(f"Undervalued: Trading at >{mos_pct}% discount to sector fair value.")
+    elif ltp <= fair_val:
+        verdict = "✋ HOLD"
+        rationale.append("Fair Value: Trading within reasonable sector multiples.")
+    else:
+        verdict = "⚠️ AVOID"
+        rationale.append("Expensive: Price exceeds conservative sector benchmarks.")
+
+    if prof_g and prof_g > 0.15:
+        rationale.append("Strong bottom-line growth.")
+    elif prof_g and prof_g < 0:
+        rationale.append("Declining profitability.")
+
+    if momentum == "Bearish":
+        rationale.append("Negative price trend (Below 200 DMA).")
+
+    return {
         "Ticker": symbol,
+        "Verdict": verdict,
         "LTP": round(ltp, 2),
         "Fair Price": round(fair_val, 2),
-        "Verdict": verdict,
-        "Momentum": "Bullish" if ltp > d200 else "Bearish",
-        "Rev Growth": f"{round(info.get('revenueGrowth', 0)*100, 1)}%" if info.get('revenueGrowth') else "N/A"
+        "MoS Buy": round(mos_price, 2),
+        "Momentum": momentum,
+        "Sales Growth (YoY)": f"{round(rev_g*100, 1)}%" if rev_g else "N/A",
+        "Profit Growth (YoY)": f"{round(prof_g*100, 1)}%" if prof_g else "N/A",
+        "Strategic Rationale": " ".join(rationale)
     }
-
-    # Auto-calculate Portfolio Profit/Loss
-    if 'average cost' in row_data:
-        cost = float(row_data['average cost'])
-        res["My P/L %"] = f"{round(((ltp/cost)-1)*100, 1)}%"
-        
-    return res
 
 # --- 3. THE UI ---
 with st.sidebar:
-    st.title("Settings")
-    st.write("The engine uses pre-set institutional fair values for each sector.")
+    st.title("Audit Settings")
+    st.write("Valuation benchmarks are hard-coded for conservative Indian market standards.")
     st.divider()
-    # The only lever you need
-    mos = st.slider("Margin of Safety %", 5, 40, 20, help="How much discount do you want before a 'BUY' signal?")
+    mos = st.slider("Required Margin of Safety %", 5, 40, 20)
     st.divider()
-    st.caption("Auto-Detecting Symbol, Qty, and Cost from CSV.")
+    st.caption("Standard Sector Multiples Applied:")
+    st.caption("- Banks: 2.2x PB | IT: 28x PE | FMCG: 45x PE")
 
 st.title("🏛️ Wealth Architect Pro")
-st.markdown("### Simple Portfolio Audit")
+st.write("Automated Fundamental & Technical Audit")
 
 uploaded_file = st.file_uploader("Upload Portfolio CSV", type=["csv"], label_visibility="collapsed")
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
     df.columns = [c.lower().strip() for c in df.columns]
-    
     ticker_col = next((c for c in df.columns if "symbol" in c or "ticker" in c), None)
 
-    if st.button("RUN AUDIT"):
-        results = []
-        bar = st.progress(0)
-        status = st.empty()
-        
-        for i, (idx, row) in enumerate(df.iterrows()):
-            sym = str(row[ticker_col]).strip()
-            if "." not in sym: sym += ".NS"
-            status.text(f"Checking {sym}...")
+    if st.button("🚀 RUN FULL AUDIT"):
+        if ticker_col:
+            results = []
+            status = st.empty()
+            prog = st.progress(0)
             
-            res = quick_analyze(sym, mos, row)
-            if res: results.append(res)
-            bar.progress((i+1)/len(df))
+            for i, (_, row) in enumerate(df.iterrows()):
+                sym = str(row[ticker_col]).strip()
+                if "." not in sym: sym += ".NS"
+                status.text(f"Analyzing {sym}...")
+                
+                res = analyze_wealth_engine(sym, mos)
+                if res: results.append(res)
+                prog.progress((i+1)/len(df))
             
-        status.empty()
-        if results:
-            st.write("---")
-            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+            status.empty()
+            if results:
+                st.write("---")
+                res_df = pd.DataFrame(results)
+                
+                # Final Table Display
+                cols = ["Ticker", "Verdict", "LTP", "Fair Price", "MoS Buy", "Momentum", "Sales Growth (YoY)", "Profit Growth (YoY)", "Strategic Rationale"]
+                st.dataframe(res_df[cols], use_container_width=True, hide_index=True)
+                
+                st.download_button("📥 Download Report", res_df.to_csv(index=False), "Market_Audit.csv")
+        else:
+            st.error("Could not find a 'Stock Symbol' column.")
