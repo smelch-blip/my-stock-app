@@ -1,606 +1,469 @@
-# app.py
-# Wealth Architect Pro (NSE) — Sector-aware valuation + MoS + Momentum gate
-# Added metrics: 50DMA, 150DMA, 200DMA, Sales growth % (YoY-3 years), Profit growth % (YoY-3 years),
-# ROCE, ROE, PB
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Optional, Tuple
 
-import streamlit as st
-import pandas as pd
-import yfinance as yf
 import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
 
-# -------------------------
-# UI SETUP
-# -------------------------
-st.set_page_config(layout="wide", page_title="Wealth Architect Pro — NSE")
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(layout="wide", page_title="Wealth Architect Pro (NSE)")
+st.title("🏛️ Wealth Architect Pro — NSE Portfolio Audit (No-Freezing Edition)")
 
-st.markdown(
-    """
-    <style>
-    .stApp { background-color: #ffffff; color: #000000; }
-    section[data-testid="stSidebar"] { background-color: #f8f9fa !important; border-right: 1px solid #dddddd; }
-    .stButton>button { background-color: #1d4ed8 !important; color: white !important; width: 100%; height: 3em; border-radius: 8px; }
-    .smallnote { font-size: 12px; color: #334155; }
-    </style>
-    """,
-    unsafe_allow_html=True,
+st.caption(
+    "Designed for Streamlit Cloud reliability: bulk price fetch + per-ticker timeouts for fundamentals. "
+    "If Yahoo blocks fundamentals, you will still get DMAs + momentum."
 )
 
-st.title("🏛️ Wealth Architect Pro — NSE")
-st.caption("Sector-aware valuation + Margin of Safety + 50/150/200 DMA + fundamentals (best-effort from yfinance)")
+# -----------------------------
+# Config
+# -----------------------------
+DEFAULT_MAX_WORKERS = 4          # keep low to reduce Yahoo throttling on Streamlit Cloud
+FUNDAMENTALS_TIMEOUT_SEC = 12    # per stock timeout for fundamentals calls
 
-# -------------------------
-# SECTOR METHOD CONFIG
-# -------------------------
-METHOD_BY_SECTOR = {
-    "Financial Services": {"method": "PB", "pb_range": (1.0, 4.0)},
-    "Industrials": {"method": "EV_EBITDA", "ev_ebitda_range": (10.0, 18.0)},
-    "Utilities": {"method": "EV_EBITDA", "ev_ebitda_range": (8.0, 14.0)},
-    "Basic Materials": {"method": "CYCLICAL_EV_EBITDA", "ev_ebitda_range": (4.0, 8.0)},
-    "Energy": {"method": "CYCLICAL_EV_EBITDA", "ev_ebitda_range": (4.0, 8.0)},
-    "Technology": {"method": "PE", "pe_range": (18.0, 45.0)},
-    "Consumer Defensive": {"method": "PE", "pe_range": (28.0, 65.0)},
-    "Consumer Cyclical": {"method": "PE", "pe_range": (18.0, 45.0)},
-    "Healthcare": {"method": "PE", "pe_range": (22.0, 50.0)},
-    "Communication Services": {"method": "PE", "pe_range": (15.0, 30.0)},
-    "Real Estate": {"method": "PE", "pe_range": (12.0, 28.0)},
-    "Default": {"method": "PE", "pe_range": (15.0, 30.0)},
+SECTOR_DEFAULTS = {
+    "Financial Services": {"method": "P/B", "target": 2.2},
+    "Basic Materials": {"method": "CYCLICAL", "target": 12.0},
+    "Energy": {"method": "CYCLICAL", "target": 10.0},
+    "Industrials": {"method": "DEBT_ADJ", "target": 20.0},
+    "Technology": {"method": "P/E", "target": 28.0},
+    "Consumer Defensive": {"method": "P/E", "target": 45.0},
+    "Consumer Cyclical": {"method": "P/E", "target": 30.0},
+    "Healthcare": {"method": "P/E", "target": 35.0},
+    "Utilities": {"method": "P/E", "target": 18.0},
+    "Communication Services": {"method": "P/E", "target": 22.0},
+    "Real Estate": {"method": "P/E", "target": 18.0},
+    "Default": {"method": "P/E", "target": 20.0},
 }
 
-def infer_sector_from_industry(industry: str) -> str:
-    ind = (industry or "").lower()
-    if any(k in ind for k in ["bank", "nbfc", "finance", "financial", "insurance", "brok", "asset management"]):
-        return "Financial Services"
-    if any(k in ind for k in ["software", "it services", "information technology", "technology"]):
-        return "Technology"
-    if any(k in ind for k in ["pharma", "pharmaceutical", "hospital", "health", "diagnostic"]):
-        return "Healthcare"
-    if any(k in ind for k in ["power", "utility", "electric", "water utility", "gas utility"]):
-        return "Utilities"
-    if any(k in ind for k in ["oil", "gas", "refining", "energy", "exploration"]):
-        return "Energy"
-    if any(k in ind for k in ["steel", "metal", "mining", "paper", "chemical", "materials", "cement"]):
-        return "Basic Materials"
-    if any(k in ind for k in ["telecom", "media", "entertainment", "communication"]):
-        return "Communication Services"
-    if any(k in ind for k in ["real estate", "reit", "property"]):
-        return "Real Estate"
-    if any(k in ind for k in ["fmcg", "beverage", "foods", "consumer", "retail", "apparel"]):
-        return "Consumer Defensive"
-    if any(k in ind for k in ["auto", "automobile", "hotel", "travel", "leisure"]):
-        return "Consumer Cyclical"
-    if any(k in ind for k in ["industrial", "engineering", "capital goods", "construction", "infrastructure", "logistics"]):
-        return "Industrials"
-    return "Default"
-
-def normalize_symbol(sym: str, default_suffix: str = ".NS") -> str:
+# -----------------------------
+# Helpers
+# -----------------------------
+def normalize_symbol(sym: str) -> str:
     s = str(sym).strip().upper()
-    if s == "" or s == "NAN":
+    if not s:
         return ""
-    if s.endswith((".NS", ".BO")):
-        return s
-    if "." in s:
-        return s
-    return s + default_suffix
+    if "." not in s:
+        s = s + ".NS"  # default NSE
+    return s
 
-def r2(x, nd=2):
-    if x is None:
-        return None
+def safe_float(x) -> Optional[float]:
     try:
-        if isinstance(x, float) and np.isnan(x):
+        if x is None:
             return None
-        return round(float(x), nd)
-    except Exception:
-        return None
-
-def pct(x, nd=1):
-    if x is None:
-        return None
-    try:
-        return round(float(x) * 100.0, nd)
-    except Exception:
-        return None
-
-def cagr_3y(end_val, start_val):
-    # 3-year CAGR from start to end: (end/start)^(1/3) - 1
-    try:
-        end_val = float(end_val)
-        start_val = float(start_val)
-        if end_val <= 0 or start_val <= 0:
+        v = float(x)
+        if np.isnan(v) or np.isinf(v):
             return None
-        return (end_val / start_val) ** (1.0 / 3.0) - 1.0
+        return v
     except Exception:
         return None
 
-def find_row(df: pd.DataFrame, candidates):
-    if df is None or df.empty:
-        return None
-    idx = [str(i).strip().lower() for i in df.index]
-    for cand in candidates:
-        c = cand.lower()
-        for i, name in enumerate(idx):
-            if c == name:
-                return df.iloc[i]
-    # fuzzy contains
-    for cand in candidates:
-        c = cand.lower()
-        for i, name in enumerate(idx):
-            if c in name:
-                return df.iloc[i]
-    return None
-
-def get_financial_frames(ticker: yf.Ticker):
-    # yfinance provides these depending on version/coverage.
-    # We'll try multiple attributes safely.
-    income = None
-    balance = None
+def cagr_from_series(values: pd.Series, years: int = 3) -> Optional[float]:
+    """
+    values: Series indexed by date/period; latest first or last — we will sort by index.
+    returns CAGR over N years as a percentage
+    """
     try:
-        income = getattr(ticker, "income_stmt", None)
-        if income is None or income.empty:
-            income = getattr(ticker, "financials", None)
+        s = values.dropna()
+        if len(s) < (years + 1):
+            return None
+        s = s.sort_index()
+        start = s.iloc[-(years + 1)]
+        end = s.iloc[-1]
+        if start <= 0 or end <= 0:
+            return None
+        return ((end / start) ** (1 / years) - 1) * 100
     except Exception:
-        income = None
-
-    try:
-        balance = getattr(ticker, "balance_sheet", None)
-    except Exception:
-        balance = None
-
-    return income, balance
-
-@st.cache_data(ttl=1800)
-def fetch_yf(symbol: str):
-    t = yf.Ticker(symbol)
-    try:
-        info = t.info or {}
-    except Exception:
-        info = {}
-    hist = t.history(period="5y", auto_adjust=False)  # enough for 200DMA + stability
-    income, balance = get_financial_frames(t)
-    return info, hist, income, balance
-
-# -------------------------
-# CORE ANALYSIS ENGINE
-# -------------------------
-def analyze_one(symbol: str, mos_pct: float, coe: float, g: float,
-                ttm_pe_haircut: float, cyclical_norm_haircut: float, debt_gate: float):
-
-    info, hist, income, balance = fetch_yf(symbol)
-
-    if hist is None or hist.empty or "Close" not in hist:
         return None
 
-    close = hist["Close"].dropna()
-    if len(close) < 210:
-        return {
-            "Ticker": symbol,
-            "Data Status": "Insufficient price history (<210 trading days)",
-            "Recommendation": "NO DATA",
-        }
+def compute_roce_best_effort(info: dict, bs: Optional[pd.DataFrame], is_stmt: Optional[pd.DataFrame]) -> Optional[float]:
+    """
+    Best-effort ROCE:
+      EBIT / (Total Assets - Current Liabilities)
+    Many times not available → return None.
+    """
+    try:
+        ebit = None
+        if is_stmt is not None:
+            # Try common keys
+            for k in ["EBIT", "Ebit", "Operating Income", "OperatingIncome", "Earnings Before Interest and Taxes"]:
+                if k in is_stmt.index:
+                    ebit = safe_float(is_stmt.loc[k].dropna().iloc[-1])
+                    break
 
-    ltp = float(close.iloc[-1])
-    d50 = float(close.rolling(50).mean().iloc[-1])
-    d150 = float(close.rolling(150).mean().iloc[-1])
-    d200 = float(close.rolling(200).mean().iloc[-1])
+        if ebit is None:
+            # fallback: sometimes Yahoo provides operatingMargins but not EBIT in statements
+            return None
 
-    # Momentum regime (death cross/weakness captured here)
-    if ltp > d50 > d200:
-        momentum = "Bullish"
-    elif ltp < d200 or d50 < d200:
-        momentum = "Bearish"
-    else:
-        momentum = "Neutral"
+        if bs is None:
+            return None
 
-    quote_type = info.get("quoteType")
-    if quote_type == "ETF":
-        return {
-            "Ticker": symbol,
-            "Sector": "ETF",
-            "Method": "ETF",
-            "LTP": r2(ltp),
-            "50DMA": r2(d50),
-            "150DMA": r2(d150),
-            "200DMA": r2(d200),
-            "Momentum": momentum,
-            "Sales growth % (YoY- 3 years)": None,
-            "Profit growth % (YoY 3years)": None,
-            "ROCE": None,
-            "ROE": None,
-            "PB": None,
-            "Fair Value": None,
-            "MoS Buy": None,
-            "Valuation Verdict": "Not Applicable",
-            "Recommendation": "ETF (Skip valuation)",
-            "Confidence": 95,
-            "Data Coverage": "High",
-            "Notes": "ETF: NAV-tracking instrument; company financials not applicable."
-        }
+        total_assets = None
+        current_liab = None
 
-    # Sector detection
-    sector = info.get("sector")
-    industry = info.get("industry")
-    if not sector:
-        sector = infer_sector_from_industry(industry)
-    cfg = METHOD_BY_SECTOR.get(sector, METHOD_BY_SECTOR["Default"])
+        for k in ["Total Assets", "TotalAssets"]:
+            if k in bs.index:
+                total_assets = safe_float(bs.loc[k].dropna().iloc[-1])
+                break
+
+        for k in ["Total Current Liabilities", "TotalCurrentLiabilities"]:
+            if k in bs.index:
+                current_liab = safe_float(bs.loc[k].dropna().iloc[-1])
+                break
+
+        if total_assets is None or current_liab is None:
+            return None
+
+        capital_employed = total_assets - current_liab
+        if capital_employed <= 0:
+            return None
+
+        return (ebit / capital_employed) * 100
+    except Exception:
+        return None
+
+def valuation_fair_price(info: dict, sector: str) -> Tuple[Optional[float], str]:
+    """
+    One-pager valuation logic (best-effort):
+    - Banks/Financials: Fair = BookValue * target P/B (adjusted by ROE)
+    - Cyclicals: Fair = (Trailing EPS * 0.8) * target PE (normalize EPS)
+    - Debt-adjusted: Fair = EPS * target PE * penalty if debtToEbitda high
+    - Else: Fair = EPS * target PE
+    """
+    cfg = SECTOR_DEFAULTS.get(sector, SECTOR_DEFAULTS["Default"])
     method = cfg["method"]
+    target = cfg["target"]
 
-    # Core fundamentals from info
-    roe = info.get("returnOnEquity")  # fraction
-    book = info.get("bookValue")
-    pb = info.get("priceToBook")      # P/B ratio
+    roe = safe_float(info.get("returnOnEquity"))
+    roe_pct = (roe * 100) if roe is not None else None
 
-    eps_fwd = info.get("forwardEps")
-    eps_ttm = info.get("trailingEps")
-    peg = info.get("pegRatio")
+    if method == "P/B":
+        bv = safe_float(info.get("bookValue"))
+        pb = safe_float(info.get("priceToBook"))
+        if bv is None or bv <= 0:
+            return None, "P/B: missing bookValue"
+        adj_target = target
+        if roe_pct is not None:
+            # scale around 15% ROE
+            adj_target = target * (roe_pct / 15.0) if roe_pct > 0 else target
+        fair = bv * adj_target
+        return fair, f"P/B model (target~{round(adj_target,2)})"
 
-    ebitda = info.get("ebitda")
-    total_debt = info.get("totalDebt")
-    cash = info.get("totalCash")
+    eps = safe_float(info.get("forwardEps")) or safe_float(info.get("trailingEps"))
+    if eps is None or eps <= 0:
+        return None, "P/E: missing EPS"
 
-    revenue_growth = info.get("revenueGrowth")
-    op_margin = info.get("operatingMargins")
-    fcf = info.get("freeCashflow")
-    payout = info.get("payoutRatio")
+    if method == "CYCLICAL":
+        fair = (eps * 0.8) * target
+        return fair, f"Cyclical EPS normalized (0.8×EPS, PE={target})"
 
-    # NetDebt/EBITDA
-    net_debt_to_ebitda = None
-    if ebitda and float(ebitda) > 0 and total_debt is not None and cash is not None:
-        try:
-            net_debt_to_ebitda = (float(total_debt) - float(cash)) / float(ebitda)
-        except Exception:
-            net_debt_to_ebitda = None
+    if method == "DEBT_ADJ":
+        d2e = safe_float(info.get("debtToEbitda"))
+        penalty = 0.8 if (d2e is not None and d2e > 3) else 1.0
+        fair = eps * target * penalty
+        return fair, f"Debt-adj PE (PE={target}, penalty={penalty})"
 
-    # ---- 3-year Sales/Profit growth (best-effort from annual income statement)
-    sales_cagr_3y = None
-    profit_cagr_3y = None
-    ebit_latest = None
-    capital_employed = None
-    roce = None
+    fair = eps * target
+    return fair, f"PE model (PE={target})"
 
-    # Income statement: rows vary by ticker/provider; we use fuzzy candidates
-    if isinstance(income, pd.DataFrame) and not income.empty:
-        # We want annual series: columns are years. Take latest and 3 years ago.
-        rev_series = find_row(income, ["total revenue", "totalrevenue", "revenue"])
-        ni_series = find_row(income, ["net income", "netincome", "net income common stockholders", "profit after tax"])
-        ebit_series = find_row(income, ["ebit", "operating income", "income from operations"])
+def momentum_state(ltp: float, d50: float, d150: float, d200: float) -> str:
+    if ltp > d50 > d150 > d200:
+        return "Bullish"
+    if d50 < d200:
+        return "Bearish (Death Cross Zone)"
+    if ltp < d200:
+        return "Bearish"
+    return "Neutral"
 
-        def get_latest_and_3y_ago(series):
-            if series is None:
-                return None, None
-            s = series.dropna()
-            if len(s) < 4:
-                return None, None
-            # income stmt columns typically newest first; sort by column name/date if possible
-            try:
-                s = s.sort_index(axis=0)  # no-op for Series, kept safe
-            except Exception:
-                pass
-            # If index is years/dates as columns, series index are columns already.
-            # We'll just take last and 4th from last based on positional order after sorting by index string.
-            try:
-                idx_sorted = sorted(list(s.index), key=lambda x: str(x))
-                s2 = s.loc[idx_sorted]
-                latest = s2.iloc[-1]
-                three_ago = s2.iloc[-4]
-                return latest, three_ago
-            except Exception:
-                # fallback: assume as-is order is newest->oldest
-                latest = s.iloc[0]
-                three_ago = s.iloc[3]
-                return latest, three_ago
+# -----------------------------
+# Fundamentals fetch with timeout safety
+# -----------------------------
+def fetch_fundamentals(symbol: str) -> Dict:
+    """
+    Best-effort Yahoo fundamentals. This can fail or be throttled. Must never freeze the whole app.
+    """
+    t = yf.Ticker(symbol)
 
-        rev_latest, rev_3ago = get_latest_and_3y_ago(rev_series)
-        ni_latest, ni_3ago = get_latest_and_3y_ago(ni_series)
+    # Avoid very heavy calls first; info can be slow but is required for sector/EPS/PB etc.
+    info = t.get_info() or {}
 
-        sales_cagr_3y = cagr_3y(rev_latest, rev_3ago)
-        profit_cagr_3y = cagr_3y(ni_latest, ni_3ago)
+    # Income statement / balance sheet are often missing for NSE tickers
+    is_stmt = None
+    bs = None
+    try:
+        # yfinance versions differ; these attributes usually exist
+        is_stmt = getattr(t, "financials", None)
+        if isinstance(is_stmt, pd.DataFrame) and is_stmt.empty:
+            is_stmt = None
+    except Exception:
+        is_stmt = None
 
-        if ebit_series is not None:
-            s = ebit_series.dropna()
-            if len(s) >= 1:
-                try:
-                    # take the newest value (best effort)
-                    ebit_latest = float(s.iloc[0])
-                except Exception:
-                    ebit_latest = None
+    try:
+        bs = getattr(t, "balance_sheet", None)
+        if isinstance(bs, pd.DataFrame) and bs.empty:
+            bs = None
+    except Exception:
+        bs = None
 
-    # Balance sheet for ROCE (best-effort)
-    if isinstance(balance, pd.DataFrame) and not balance.empty:
-        assets_series = find_row(balance, ["total assets"])
-        cl_series = find_row(balance, ["total current liabilities", "current liabilities"])
-        # capital employed approx = Total Assets - Total Current Liabilities
-        if assets_series is not None and cl_series is not None:
-            try:
-                assets_latest = float(assets_series.dropna().iloc[0])
-                cl_latest = float(cl_series.dropna().iloc[0])
-                capital_employed = assets_latest - cl_latest
-            except Exception:
-                capital_employed = None
+    # Try revenue + profit growth (3Y CAGR)
+    rev_cagr = None
+    prof_cagr = None
+    if is_stmt is not None:
+        # Common Yahoo keys
+        rev_key_candidates = ["Total Revenue", "TotalRevenue"]
+        prof_key_candidates = ["Net Income", "NetIncome"]
 
-    # ROCE approx
-    if ebit_latest is not None and capital_employed is not None and capital_employed > 0:
-        try:
-            roce = ebit_latest / capital_employed
-        except Exception:
-            roce = None
+        rev_series = None
+        prof_series = None
 
-    # ---- Data coverage + confidence
-    missing = 0
-    for k in [roe, pb, sales_cagr_3y, profit_cagr_3y, roce]:
-        if k is None:
-            missing += 1
-    data_coverage = {0: "High", 1: "Medium", 2: "Low", 3: "Very Low", 4: "Very Low", 5: "Very Low"}.get(missing, "Very Low")
+        for k in rev_key_candidates:
+            if k in is_stmt.index:
+                rev_series = is_stmt.loc[k]
+                break
+        for k in prof_key_candidates:
+            if k in is_stmt.index:
+                prof_series = is_stmt.loc[k]
+                break
 
-    conf = 90
-    conf -= 8 * missing
-    if method == "PB" and (book is None or roe is None):
-        conf -= 15
-    if method in ["EV_EBITDA", "CYCLICAL_EV_EBITDA"] and (ebitda is None):
-        conf -= 15
-    if method == "PE" and (eps_fwd is None and eps_ttm is None):
-        conf -= 15
-    conf = max(0, min(100, conf))
+        if isinstance(rev_series, pd.Series):
+            rev_cagr = cagr_from_series(rev_series, years=3)
+        if isinstance(prof_series, pd.Series):
+            prof_cagr = cagr_from_series(prof_series, years=3)
 
-    # ---- Hard stops
-    hard_stop = False
-    reasons = []
-
-    if payout is not None and payout > 1.0:
-        hard_stop = True
-        reasons.append("Dividend > Earnings (payoutRatio > 1)")
-
-    if net_debt_to_ebitda is not None and net_debt_to_ebitda > debt_gate and sector not in ["Utilities"]:
-        hard_stop = True
-        reasons.append(f"NetDebt/EBITDA > {debt_gate:g}")
-
-    # ---- Quality score
-    q_score = 0
-    if roe is not None and roe > 0.15: q_score += 25
-    if roce is not None and roce > 0.15: q_score += 25
-    if sales_cagr_3y is not None and sales_cagr_3y > 0.12: q_score += 20
-    if profit_cagr_3y is not None and profit_cagr_3y > 0.12: q_score += 20
-    if fcf is not None and fcf > 0: q_score += 10
-
-    # -------------------------
-    # VALUATION
-    # -------------------------
-    fair_val = None
-    basis = None
-
-    if method == "PB":
-        # justified PB ~ (ROE - g) / (CoE - g) clamped to pb_range
-        if book and float(book) > 0 and roe and float(roe) > 0:
-            coe_f = max(0.06, float(coe))
-            g_f = min(float(g), coe_f - 0.01)
-            denom = (coe_f - g_f)
-            justified_pb = (float(roe) - g_f) / denom if denom > 0 else None
-            if justified_pb is None or not np.isfinite(justified_pb) or justified_pb <= 0:
-                justified_pb = 2.0
-            pb_min, pb_max = cfg.get("pb_range", (1.0, 4.0))
-            justified_pb = max(pb_min, min(pb_max, justified_pb))
-            fair_val = float(book) * float(justified_pb)
-            basis = f"P/B (justified PB≈{r2(justified_pb,2)})"
-
-    elif method == "EV_EBITDA":
-        if ebitda and float(ebitda) > 0:
-            lo, hi = cfg.get("ev_ebitda_range", (10.0, 18.0))
-            mid = (lo + hi) / 2.0
-            if net_debt_to_ebitda is not None and net_debt_to_ebitda > 3:
-                mid *= 0.85
-            fair_ev = float(ebitda) * float(mid)
-            net_debt = (float(total_debt) - float(cash)) if (total_debt is not None and cash is not None) else 0.0
-            fair_equity = fair_ev - float(net_debt)
-            market_cap = info.get("marketCap")
-            shares = (float(market_cap) / float(ltp)) if (market_cap and ltp > 0) else None
-            if shares and shares > 0:
-                fair_val = fair_equity / shares
-                basis = f"EV/EBITDA (fair≈{r2(mid,2)}x)"
-
-    elif method == "CYCLICAL_EV_EBITDA":
-        if ebitda and float(ebitda) > 0:
-            lo, hi = cfg.get("ev_ebitda_range", (4.0, 8.0))
-            mid = (lo + hi) / 2.0
-            norm_ebitda = float(ebitda) * (1.0 - float(cyclical_norm_haircut))
-            fair_ev = norm_ebitda * float(mid)
-            net_debt = (float(total_debt) - float(cash)) if (total_debt is not None and cash is not None) else 0.0
-            fair_equity = fair_ev - float(net_debt)
-            market_cap = info.get("marketCap")
-            shares = (float(market_cap) / float(ltp)) if (market_cap and ltp > 0) else None
-            if shares and shares > 0:
-                fair_val = fair_equity / shares
-                basis = f"Norm EV/EBITDA (EBITDA -{int(cyclical_norm_haircut*100)}%, fair≈{r2(mid,2)}x)"
-
-    else:  # PE
-        pe_min, pe_max = cfg.get("pe_range", (15.0, 30.0))
-        base_pe = (pe_min + pe_max) / 2.0
-        if peg is not None:
-            try:
-                if float(peg) < 1.2: base_pe *= 1.10
-                elif float(peg) > 2.0: base_pe *= 0.85
-            except Exception:
-                pass
-        base_pe = max(pe_min, min(pe_max, base_pe))
-
-        eps_used = None
-        eff_pe = base_pe
-
-        if eps_fwd is not None and eps_fwd > 0:
-            eps_used = float(eps_fwd)
-            basis = f"P/E (Forward EPS, fairPE≈{r2(eff_pe,2)})"
-        elif eps_ttm is not None and eps_ttm > 0:
-            eps_used = float(eps_ttm)
-            eff_pe = base_pe * float(ttm_pe_haircut)
-            basis = f"P/E (TTM EPS, fairPE≈{r2(eff_pe,2)} after haircut)"
-
-        if eps_used is not None and eff_pe > 0:
-            fair_val = eps_used * eff_pe
-
-    if fair_val is None or fair_val <= 0:
-        return {
-            "Ticker": symbol,
-            "Sector": sector,
-            "Industry": industry,
-            "Method": method,
-            "LTP": r2(ltp),
-            "50DMA": r2(d50),
-            "150DMA": r2(d150),
-            "200DMA": r2(d200),
-            "Momentum": momentum,
-            "Sales growth % (YoY- 3 years)": pct(sales_cagr_3y, 1),
-            "Profit growth % (YoY 3years)": pct(profit_cagr_3y, 1),
-            "ROCE": pct(roce, 1),
-            "ROE": pct(roe, 1),
-            "PB": r2(pb, 2),
-            "Fair Value": None,
-            "MoS Buy": None,
-            "Valuation Basis": None,
-            "Recommendation": "HOLD / WATCH (Valuation NA)",
-            "Confidence": conf,
-            "Data Coverage": data_coverage,
-            "Notes": "Missing valuation inputs for this method (common for some NSE tickers on yfinance)."
-        }
-
-    mos_price = fair_val * (1.0 - mos_pct / 100.0)
-
-    # Recommendation rules (no strong buy in bearish trend)
-    if hard_stop:
-        rec = f"AVOID ({'; '.join(reasons)})"
-    else:
-        if momentum == "Bearish":
-            if ltp <= mos_price:
-                rec = "WATCHLIST (Cheap but trend bearish)"
-            elif ltp <= fair_val:
-                rec = "HOLD / WATCH (Trend bearish)"
-            else:
-                rec = "AVOID (Expensive + bearish)"
-        else:
-            if ltp <= mos_price and q_score >= 60:
-                rec = "STRONG BUY / ADD"
-            elif ltp <= fair_val and q_score >= 45:
-                rec = "HOLD / ACCUMULATE ON DIPS"
-            elif ltp <= fair_val:
-                rec = "HOLD / WATCH"
-            else:
-                rec = "WAIT / AVOID"
+    roce = compute_roce_best_effort(info, bs, is_stmt)
 
     return {
-        "Ticker": symbol,
-        "Sector": sector,
-        "Industry": industry,
-        "Method": method,
-        "LTP": r2(ltp),
-        "50DMA": r2(d50),
-        "150DMA": r2(d150),
-        "200DMA": r2(d200),
-        "Momentum": momentum,
-        "Sales growth % (YoY- 3 years)": pct(sales_cagr_3y, 1),
-        "Profit growth % (YoY 3years)": pct(profit_cagr_3y, 1),
-        "ROCE": pct(roce, 1),
-        "ROE": pct(roe, 1),
-        "PB": r2(pb, 2),
-        "Fair Value": r2(fair_val, 2),
-        "MoS Buy": r2(mos_price, 2),
-        "Valuation Basis": basis,
-        "Quality Score": q_score,
-        "Confidence": conf,
-        "Data Coverage": data_coverage,
-        "Recommendation": rec,
-        "Notes": ""
+        "info": info,
+        "rev_cagr_3y": rev_cagr,
+        "profit_cagr_3y": prof_cagr,
+        "roce": roce,
     }
 
-# -------------------------
-# SIDEBAR
-# -------------------------
+# -----------------------------
+# Main
+# -----------------------------
 with st.sidebar:
-    st.header("Controls")
+    st.header("Settings")
+    mos_val = st.slider("Margin of Safety %", 5, 40, 20)
+    max_workers = st.slider("Parallel workers (Cloud-safe)", 1, 8, DEFAULT_MAX_WORKERS)
+    st.markdown("---")
+    st.caption("Tip: If you see many timeouts, reduce workers to 2–3.")
 
-    suffix_choice = st.selectbox("Default ticker suffix", [".NS (NSE)", ".BO (BSE)"], index=0)
-    default_suffix = ".NS" if suffix_choice.startswith(".NS") else ".BO"
-
-    mos = st.slider("Margin of Safety (MoS) %", 5, 40, 20)
-
-    st.subheader("Financials (P/B) inputs")
-    coe = st.slider("Cost of Equity (CoE)", 0.08, 0.22, 0.14, 0.01)
-    g = st.slider("Long-term Growth (g)", 0.03, 0.14, 0.08, 0.01)
-    if g >= coe:
-        st.warning("Keep g < CoE for justified P/B to behave sensibly.")
-
-    st.subheader("P/E controls")
-    ttm_haircut = st.slider("TTM EPS haircut on fair P/E", 0.60, 1.00, 0.85, 0.05)
-
-    st.subheader("Cyclical controls")
-    cyc_norm = st.slider("Cyclical normalization haircut on EBITDA", 0.10, 0.60, 0.35, 0.05)
-
-    st.subheader("Risk gate")
-    debt_gate = st.slider("Hard stop NetDebt/EBITDA (non-utilities)", 2.0, 6.0, 3.0, 0.5)
-
-    st.markdown(
-        '<div class="smallnote">'
-        "<b>Note:</b> Sales/Profit 3-year growth, ROCE are computed from annual statements when available. "
-        "If missing on yfinance, they will be blank and Confidence will drop."
-        "</div>",
-        unsafe_allow_html=True
-    )
-
-# -------------------------
-# UPLOAD + RUN
-# -------------------------
-uploaded = st.file_uploader("Upload your portfolio (CSV or XLSX)", type=["csv", "xlsx"])
+uploaded = st.file_uploader("Upload portfolio CSV (must include a symbol/ticker column)", type=["csv"])
 
 if uploaded:
-    if uploaded.name.lower().endswith(".csv"):
-        df = pd.read_csv(uploaded)
-    else:
-        df = pd.read_excel(uploaded)
-
+    df = pd.read_csv(uploaded)
     df.columns = [c.lower().strip() for c in df.columns]
 
-    symbol_candidates = [c for c in df.columns if ("symbol" in c) or ("ticker" in c)]
-    if not symbol_candidates:
-        st.error("No symbol/ticker column found. Add a column like 'stock symbol' or 'ticker'.")
+    # Find symbol column
+    tick_col = next((c for c in df.columns if "stock symbol" in c or "symbol" in c or "ticker" in c), None)
+    name_col = next((c for c in df.columns if "company" in c or "name" in c), None)
+
+    if not tick_col:
+        st.error("Could not find a symbol column. Use a column like: Stock Symbol / Symbol / Ticker")
         st.stop()
 
-    symbol_col = st.selectbox("Which column has the ticker?", symbol_candidates)
+    symbols = [normalize_symbol(x) for x in df[tick_col].dropna().astype(str).tolist()]
+    symbols = [s for s in symbols if s]
 
-    if st.button("🚀 RUN ANALYSIS"):
+    if st.button("🚀 Run Analysis (No Freeze)"):
+        st.info(f"Processing {len(symbols)} tickers…")
+
+        # 1) BULK PRICE FETCH (fast)
+        with st.spinner("Fetching price history (bulk)…"):
+            # group_by="ticker" gives multiindex columns for multiple tickers
+            prices = yf.download(
+                tickers=" ".join(symbols),
+                period="1y",
+                interval="1d",
+                group_by="ticker",
+                threads=True,
+                auto_adjust=False,
+                progress=False,
+            )
+
+        # Normalize prices into dict: sym -> close series
+        close_map = {}
+        if isinstance(prices.columns, pd.MultiIndex):
+            for sym in symbols:
+                if sym in prices.columns.get_level_values(0):
+                    s = prices[sym]["Close"].dropna()
+                    if len(s) > 0:
+                        close_map[sym] = s
+        else:
+            # single ticker case
+            s = prices["Close"].dropna()
+            if len(s) > 0:
+                close_map[symbols[0]] = s
+
+        # 2) Fundamentals fetch with timeout (parallel but safe)
         results = []
-        status = st.empty()
+        success = 0
+        no_price = 0
+        timeouts = 0
+        errors = 0
+
         progress = st.progress(0)
+        status = st.empty()
 
-        tickers = df[symbol_col].dropna().astype(str).tolist()
-        total = len(tickers)
+        def process_one(sym: str) -> Dict:
+            # price-derived metrics
+            close = close_map.get(sym)
+            if close is None or len(close) < 210:
+                return {"Ticker": sym, "ERROR": "No price / insufficient history"}
 
-        for i, raw in enumerate(tickers):
-            sym = normalize_symbol(raw, default_suffix)
-            if not sym:
-                continue
+            ltp = float(close.iloc[-1])
+            d50 = float(close.rolling(50).mean().iloc[-1])
+            d150 = float(close.rolling(150).mean().iloc[-1])
+            d200 = float(close.rolling(200).mean().iloc[-1])
 
-            status.info(f"Analyzing {sym} ({i+1}/{total}) ...")
-            out = analyze_one(sym, mos, coe, g, ttm_haircut, cyc_norm, debt_gate)
-            if out:
-                results.append(out)
+            # fundamentals (timeout-protected outside)
+            return {
+                "Ticker": sym,
+                "TECH: LTP": round(ltp, 2),
+                "TECH: 50DMA": round(d50, 2),
+                "TECH: 150DMA": round(d150, 2),
+                "TECH: 200DMA": round(d200, 2),
+            }
 
-            progress.progress((i + 1) / total)
+        # First build base rows from price
+        base_rows = {sym: process_one(sym) for sym in symbols}
+
+        # Now enrich fundamentals using futures
+        with st.spinner("Fetching fundamentals (best-effort, timeout protected)…"):
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {executor.submit(fetch_fundamentals, sym): sym for sym in symbols}
+
+                completed = 0
+                for fut in as_completed(future_map):
+                    sym = future_map[fut]
+                    completed += 1
+                    progress.progress(completed / len(symbols))
+                    status.write(f"Fundamentals: {sym} ({completed}/{len(symbols)})")
+
+                    row = base_rows.get(sym, {"Ticker": sym})
+
+                    # If no price data, keep it and skip fundamentals
+                    if "ERROR" in row:
+                        no_price += 1
+                        results.append(row)
+                        continue
+
+                    try:
+                        data = fut.result(timeout=FUNDAMENTALS_TIMEOUT_SEC)
+                        info = data.get("info", {}) or {}
+                        sector = info.get("sector") or "Default"
+
+                        roe = safe_float(info.get("returnOnEquity"))
+                        roe_pct = round((roe * 100), 2) if roe is not None else None
+
+                        pb = safe_float(info.get("priceToBook"))
+                        pb_val = round(pb, 2) if pb is not None else None
+
+                        # Sales/profit growth CAGR 3Y best-effort
+                        sales_g = data.get("rev_cagr_3y")
+                        prof_g = data.get("profit_cagr_3y")
+                        roce = data.get("roce")
+
+                        fair, val_note = valuation_fair_price(info, sector)
+                        mos_price = (fair * (1 - mos_val / 100)) if (fair is not None) else None
+
+                        mom = momentum_state(
+                            row["TECH: LTP"], row["TECH: 50DMA"], row["TECH: 150DMA"], row["TECH: 200DMA"]
+                        )
+
+                        # Final recommendation logic
+                        rec = "Neutral / Wait"
+                        if fair is None:
+                            rec = "Insufficient Data"
+                        else:
+                            if row["TECH: LTP"] <= mos_price and mom != "Bearish":
+                                rec = "Strong Buy / Add"
+                            elif row["TECH: LTP"] <= fair:
+                                rec = "Hold / Watch"
+                            else:
+                                rec = "Avoid / Expensive"
+
+                        # Confidence / coverage
+                        coverage = []
+                        if roe_pct is not None: coverage.append("ROE")
+                        if pb_val is not None: coverage.append("PB")
+                        if sales_g is not None: coverage.append("Sales3Y")
+                        if prof_g is not None: coverage.append("Profit3Y")
+                        if roce is not None: coverage.append("ROCE")
+                        coverage_str = ",".join(coverage) if coverage else "Price-only"
+
+                        row.update({
+                            "FND: Sector": sector,
+                            "FND: ROE": roe_pct,
+                            "FND: ROCE": round(roce, 2) if roce is not None else None,
+                            "FND: Sales growth % (YOY-3 years)": round(sales_g, 2) if sales_g is not None else None,
+                            "FND: Profit growth % (YOY 3years)": round(prof_g, 2) if prof_g is not None else None,
+                            "VAL: PB": pb_val,
+                            "VAL: Fair Price": round(fair, 2) if fair is not None else None,
+                            "VAL: MoS Buy": round(mos_price, 2) if mos_price is not None else None,
+                            "VAL: Method Note": val_note,
+                            "FINAL: Momentum": mom,
+                            "FINAL: Recommendation": rec,
+                            "FINAL: Data Coverage": coverage_str
+                        })
+
+                        success += 1
+                        results.append(row)
+
+                    except TimeoutError:
+                        timeouts += 1
+                        row.update({
+                            "FND: Sector": None,
+                            "FINAL: Recommendation": "Timeout (Yahoo throttling)",
+                            "FINAL: Data Coverage": "Price-only"
+                        })
+                        results.append(row)
+                    except Exception:
+                        errors += 1
+                        row.update({
+                            "FND: Sector": None,
+                            "FINAL: Recommendation": "Error in fundamentals",
+                            "FINAL: Data Coverage": "Price-only"
+                        })
+                        results.append(row)
 
         status.empty()
-
-        if not results:
-            st.error("No results generated. Check symbols and try again.")
-            st.stop()
+        progress.empty()
 
         res_df = pd.DataFrame(results)
 
-        # Force a clean column order with your requested metrics prominent
-        preferred_order = [
-            "Ticker", "Sector", "Industry", "Method",
-            "LTP", "50DMA", "150DMA", "200DMA", "Momentum",
-            "Sales growth % (YoY- 3 years)", "Profit growth % (YoY 3years)", "ROCE", "ROE", "PB",
-            "Fair Value", "MoS Buy", "Valuation Basis",
-            "Quality Score", "Confidence", "Data Coverage", "Recommendation", "Notes"
-        ]
-        ordered = [c for c in preferred_order if c in res_df.columns] + [c for c in res_df.columns if c not in preferred_order]
-        res_df = res_df[ordered]
+        # Attach company name if present in uploaded file
+        if name_col:
+            # make a mapping for display
+            m = {}
+            for _, r in df.iterrows():
+                sym = normalize_symbol(r.get(tick_col, ""))
+                nm = r.get(name_col, "")
+                if sym and nm:
+                    m[sym] = nm
+            res_df.insert(0, "Company", res_df["Ticker"].map(m).fillna(res_df["Ticker"]))
 
-        st.subheader("Results")
+        # Make columns order friendly
+        preferred = [c for c in [
+            "Company", "Ticker",
+            "TECH: LTP", "TECH: 50DMA", "TECH: 150DMA", "TECH: 200DMA",
+            "FND: Sector", "FND: Sales growth % (YOY-3 years)", "FND: Profit growth % (YOY 3years)",
+            "FND: ROE", "FND: ROCE",
+            "VAL: PB", "VAL: Fair Price", "VAL: MoS Buy", "VAL: Method Note",
+            "FINAL: Momentum", "FINAL: Recommendation", "FINAL: Data Coverage",
+            "ERROR"
+        ] if c in res_df.columns]
+
+        res_df = res_df[preferred] if preferred else res_df
+
+        st.success(
+            f"Done. Success: {success} | No-price: {no_price} | Timeouts: {timeouts} | Errors: {errors}"
+        )
+
         st.dataframe(res_df, use_container_width=True, hide_index=True)
 
         csv_bytes = res_df.to_csv(index=False).encode("utf-8")
@@ -611,14 +474,10 @@ if uploaded:
             mime="text/csv",
         )
 
+st.markdown("---")
 st.markdown(
-    "### How to run (local)\n"
-    "1) Install:\n"
-    "```bash\n"
-    "pip install streamlit yfinance pandas numpy openpyxl\n"
-    "```\n"
-    "2) Run:\n"
-    "```bash\n"
-    "streamlit run app.py\n"
-    "```\n"
+    "### Notes\n"
+    "- **Sales/Profit growth & ROCE** depend on Yahoo providing financial statements for the ticker. For many NSE stocks, Yahoo sometimes returns **blank**.\n"
+    "- The app will still work using **DMA + momentum + best-effort valuation**.\n"
+    "- If you see many **Timeouts**, reduce parallel workers to **2–3** and re-run.\n"
 )
