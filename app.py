@@ -1,29 +1,27 @@
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Optional, Tuple
+from typing import Optional, Dict, List
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(layout="wide", page_title="Wealth Architect Pro (NSE)")
-st.title("🏛️ Wealth Architect Pro — NSE Portfolio Audit (No-Freezing Edition)")
+
+# =========================
+# UI CONFIG
+# =========================
+st.set_page_config(layout="wide", page_title="Wealth Architect Pro")
+st.title("🏛️ Wealth Architect Pro — NSE Portfolio Audit")
 
 st.caption(
-    "Designed for Streamlit Cloud reliability: bulk price fetch + per-ticker timeouts for fundamentals. "
-    "If Yahoo blocks fundamentals, you will still get DMAs + momentum."
+    "This version renders your output UI exactly like your template "
+    "(same metric names + same sequence + grouped header)."
 )
 
-# -----------------------------
-# Config
-# -----------------------------
-DEFAULT_MAX_WORKERS = 4          # keep low to reduce Yahoo throttling on Streamlit Cloud
-FUNDAMENTALS_TIMEOUT_SEC = 12    # per stock timeout for fundamentals calls
-
+# =========================
+# SECTOR DEFAULTS (Valuation)
+# =========================
 SECTOR_DEFAULTS = {
     "Financial Services": {"method": "P/B", "target": 2.2},
     "Basic Materials": {"method": "CYCLICAL", "target": 12.0},
@@ -39,16 +37,18 @@ SECTOR_DEFAULTS = {
     "Default": {"method": "P/E", "target": 20.0},
 }
 
-# -----------------------------
-# Helpers
-# -----------------------------
+
+# =========================
+# HELPERS
+# =========================
 def normalize_symbol(sym: str) -> str:
     s = str(sym).strip().upper()
     if not s:
         return ""
     if "." not in s:
-        s = s + ".NS"  # default NSE
+        s += ".NS"
     return s
+
 
 def safe_float(x) -> Optional[float]:
     try:
@@ -61,54 +61,113 @@ def safe_float(x) -> Optional[float]:
     except Exception:
         return None
 
-def cagr_from_series(values: pd.Series, years: int = 3) -> Optional[float]:
+
+def pct_fmt(x: Optional[float]) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        return round(float(x), 2)
+    except Exception:
+        return None
+
+
+def round2(x: Optional[float]) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        return round(float(x), 2)
+    except Exception:
+        return None
+
+
+def calc_cagr(series: pd.Series, years: int = 3) -> Optional[float]:
     """
-    values: Series indexed by date/period; latest first or last — we will sort by index.
-    returns CAGR over N years as a percentage
+    Uses a 3Y CAGR as a practical "YOY-3 years" proxy if we have >= 4 annual points.
     """
     try:
-        s = values.dropna()
+        s = series.dropna()
         if len(s) < (years + 1):
             return None
         s = s.sort_index()
-        start = s.iloc[-(years + 1)]
-        end = s.iloc[-1]
+        start = float(s.iloc[-(years + 1)])
+        end = float(s.iloc[-1])
         if start <= 0 or end <= 0:
             return None
         return ((end / start) ** (1 / years) - 1) * 100
     except Exception:
         return None
 
+
+def momentum_label(ltp: float, d50: float, d150: float, d200: float) -> str:
+    if ltp > d50 > d150 > d200:
+        return "Bullish"
+    if d50 < d200:
+        return "Bearish"
+    if ltp < d200:
+        return "Bearish"
+    return "Neutral"
+
+
+def valuation_fair_price(info: dict, sector: str) -> (Optional[float], str):
+    cfg = SECTOR_DEFAULTS.get(sector, SECTOR_DEFAULTS["Default"])
+    method = cfg["method"]
+    target = cfg["target"]
+
+    roe = safe_float(info.get("returnOnEquity"))
+    roe_pct = (roe * 100) if roe is not None else None
+
+    if method == "P/B":
+        bv = safe_float(info.get("bookValue"))
+        if bv is None or bv <= 0:
+            return None, "P/B: missing bookValue"
+        adj_target = target
+        if roe_pct is not None and roe_pct > 0:
+            adj_target = target * (roe_pct / 15.0)
+        fair = bv * adj_target
+        return fair, f"P/B (target~{round(adj_target, 2)})"
+
+    eps = safe_float(info.get("forwardEps")) or safe_float(info.get("trailingEps"))
+    if eps is None or eps <= 0:
+        return None, "P/E: missing EPS"
+
+    if method == "CYCLICAL":
+        fair = (eps * 0.8) * target  # normalize EPS
+        return fair, f"CYCLICAL (0.8×EPS, PE={target})"
+
+    if method == "DEBT_ADJ":
+        d2e = safe_float(info.get("debtToEbitda"))
+        penalty = 0.8 if (d2e is not None and d2e > 3) else 1.0
+        fair = eps * target * penalty
+        return fair, f"DEBT_ADJ (PE={target}, penalty={penalty})"
+
+    fair = eps * target
+    return fair, f"P/E (PE={target})"
+
+
 def compute_roce_best_effort(info: dict, bs: Optional[pd.DataFrame], is_stmt: Optional[pd.DataFrame]) -> Optional[float]:
     """
-    Best-effort ROCE:
-      EBIT / (Total Assets - Current Liabilities)
-    Many times not available → return None.
+    Best-effort ROCE = EBIT / (Total Assets - Current Liabilities).
+    Often NA for NSE on Yahoo. We'll return None if missing.
     """
     try:
-        ebit = None
-        if is_stmt is not None:
-            # Try common keys
-            for k in ["EBIT", "Ebit", "Operating Income", "OperatingIncome", "Earnings Before Interest and Taxes"]:
-                if k in is_stmt.index:
-                    ebit = safe_float(is_stmt.loc[k].dropna().iloc[-1])
-                    break
-
-        if ebit is None:
-            # fallback: sometimes Yahoo provides operatingMargins but not EBIT in statements
+        if is_stmt is None or bs is None:
             return None
 
-        if bs is None:
+        ebit = None
+        for k in ["EBIT", "Ebit", "Operating Income", "OperatingIncome"]:
+            if k in is_stmt.index:
+                ebit = safe_float(is_stmt.loc[k].dropna().iloc[-1])
+                break
+        if ebit is None:
             return None
 
         total_assets = None
-        current_liab = None
-
         for k in ["Total Assets", "TotalAssets"]:
             if k in bs.index:
                 total_assets = safe_float(bs.loc[k].dropna().iloc[-1])
                 break
 
+        current_liab = None
         for k in ["Total Current Liabilities", "TotalCurrentLiabilities"]:
             if k in bs.index:
                 current_liab = safe_float(bs.loc[k].dropna().iloc[-1])
@@ -125,76 +184,18 @@ def compute_roce_best_effort(info: dict, bs: Optional[pd.DataFrame], is_stmt: Op
     except Exception:
         return None
 
-def valuation_fair_price(info: dict, sector: str) -> Tuple[Optional[float], str]:
-    """
-    One-pager valuation logic (best-effort):
-    - Banks/Financials: Fair = BookValue * target P/B (adjusted by ROE)
-    - Cyclicals: Fair = (Trailing EPS * 0.8) * target PE (normalize EPS)
-    - Debt-adjusted: Fair = EPS * target PE * penalty if debtToEbitda high
-    - Else: Fair = EPS * target PE
-    """
-    cfg = SECTOR_DEFAULTS.get(sector, SECTOR_DEFAULTS["Default"])
-    method = cfg["method"]
-    target = cfg["target"]
 
-    roe = safe_float(info.get("returnOnEquity"))
-    roe_pct = (roe * 100) if roe is not None else None
-
-    if method == "P/B":
-        bv = safe_float(info.get("bookValue"))
-        pb = safe_float(info.get("priceToBook"))
-        if bv is None or bv <= 0:
-            return None, "P/B: missing bookValue"
-        adj_target = target
-        if roe_pct is not None:
-            # scale around 15% ROE
-            adj_target = target * (roe_pct / 15.0) if roe_pct > 0 else target
-        fair = bv * adj_target
-        return fair, f"P/B model (target~{round(adj_target,2)})"
-
-    eps = safe_float(info.get("forwardEps")) or safe_float(info.get("trailingEps"))
-    if eps is None or eps <= 0:
-        return None, "P/E: missing EPS"
-
-    if method == "CYCLICAL":
-        fair = (eps * 0.8) * target
-        return fair, f"Cyclical EPS normalized (0.8×EPS, PE={target})"
-
-    if method == "DEBT_ADJ":
-        d2e = safe_float(info.get("debtToEbitda"))
-        penalty = 0.8 if (d2e is not None and d2e > 3) else 1.0
-        fair = eps * target * penalty
-        return fair, f"Debt-adj PE (PE={target}, penalty={penalty})"
-
-    fair = eps * target
-    return fair, f"PE model (PE={target})"
-
-def momentum_state(ltp: float, d50: float, d150: float, d200: float) -> str:
-    if ltp > d50 > d150 > d200:
-        return "Bullish"
-    if d50 < d200:
-        return "Bearish (Death Cross Zone)"
-    if ltp < d200:
-        return "Bearish"
-    return "Neutral"
-
-# -----------------------------
-# Fundamentals fetch with timeout safety
-# -----------------------------
+# =========================
+# FUNDAMENTALS FETCH (best-effort)
+# =========================
 def fetch_fundamentals(symbol: str) -> Dict:
-    """
-    Best-effort Yahoo fundamentals. This can fail or be throttled. Must never freeze the whole app.
-    """
     t = yf.Ticker(symbol)
-
-    # Avoid very heavy calls first; info can be slow but is required for sector/EPS/PB etc.
     info = t.get_info() or {}
 
-    # Income statement / balance sheet are often missing for NSE tickers
+    # financial statements (often missing for NSE)
     is_stmt = None
     bs = None
     try:
-        # yfinance versions differ; these attributes usually exist
         is_stmt = getattr(t, "financials", None)
         if isinstance(is_stmt, pd.DataFrame) and is_stmt.empty:
             is_stmt = None
@@ -208,74 +209,216 @@ def fetch_fundamentals(symbol: str) -> Dict:
     except Exception:
         bs = None
 
-    # Try revenue + profit growth (3Y CAGR)
-    rev_cagr = None
-    prof_cagr = None
+    # sales/profit growth (3Y CAGR proxy) if we can read statements
+    sales_cagr = None
+    profit_cagr = None
     if is_stmt is not None:
-        # Common Yahoo keys
-        rev_key_candidates = ["Total Revenue", "TotalRevenue"]
-        prof_key_candidates = ["Net Income", "NetIncome"]
-
-        rev_series = None
-        prof_series = None
-
-        for k in rev_key_candidates:
+        rev = None
+        prof = None
+        for k in ["Total Revenue", "TotalRevenue"]:
             if k in is_stmt.index:
-                rev_series = is_stmt.loc[k]
+                rev = is_stmt.loc[k]
                 break
-        for k in prof_key_candidates:
+        for k in ["Net Income", "NetIncome"]:
             if k in is_stmt.index:
-                prof_series = is_stmt.loc[k]
+                prof = is_stmt.loc[k]
                 break
 
-        if isinstance(rev_series, pd.Series):
-            rev_cagr = cagr_from_series(rev_series, years=3)
-        if isinstance(prof_series, pd.Series):
-            prof_cagr = cagr_from_series(prof_series, years=3)
+        if isinstance(rev, pd.Series):
+            sales_cagr = calc_cagr(rev, years=3)
+        if isinstance(prof, pd.Series):
+            profit_cagr = calc_cagr(prof, years=3)
 
     roce = compute_roce_best_effort(info, bs, is_stmt)
 
     return {
         "info": info,
-        "rev_cagr_3y": rev_cagr,
-        "profit_cagr_3y": prof_cagr,
-        "roce": roce,
+        "sales_cagr": sales_cagr,
+        "profit_cagr": profit_cagr,
+        "roce": roce
     }
 
-# -----------------------------
-# Main
-# -----------------------------
+
+# =========================
+# EXACT UI TABLE RENDER (your grouped header)
+# =========================
+def render_grouped_table(df: pd.DataFrame) -> str:
+    """
+    Renders HTML with a two-row header:
+      Row1: groups (Technicals/Fundamentals/Valuation/Final)
+      Row2: exact metric names in exact order
+    """
+    # Colors close to your screenshot
+    col_left = "#cfeecf"      # light green
+    col_tech = "#bfe3ff"      # light blue
+    col_fnd = "#c8f5c8"       # light green
+    col_val = "#bfe3ff"       # light blue
+    col_final = "#bfe3ff"     # light blue
+
+    css = f"""
+    <style>
+      .wa-table {{
+        border-collapse: collapse;
+        width: 100%;
+        font-family: Arial, sans-serif;
+        font-size: 13px;
+      }}
+      .wa-table th, .wa-table td {{
+        border: 1px solid #d0d0d0;
+        padding: 8px;
+        text-align: center;
+        vertical-align: middle;
+        white-space: nowrap;
+      }}
+      .wa-table thead tr:first-child th {{
+        font-weight: 700;
+        font-size: 14px;
+      }}
+      .wa-left {{ background: {col_left}; }}
+      .wa-tech {{ background: {col_tech}; }}
+      .wa-fnd {{ background: {col_fnd}; }}
+      .wa-val {{ background: {col_val}; }}
+      .wa-final {{ background: {col_final}; }}
+      .wa-table tbody tr:hover {{ background: #f7fbff; }}
+      .wa-num {{ text-align: right; }}
+      .wa-text {{ text-align: left; }}
+    </style>
+    """
+
+    # Group header row (colspans must match your layout)
+    # Columns EXACT order & names as requested:
+    # Company, LTP,
+    # 50DMA, 150DMA, 200DMA,
+    # Sales growth % (YOY-3 years), Profit growth % (YOY 3years), ROE, ROCE,
+    # VAL: PB, VAL: Fair, VAL: MoS Buy, VAL: Method,
+    # Momentum, Recommendation, Reason
+
+    header_row_1 = """
+    <tr>
+      <th class="wa-left" colspan="2"></th>
+      <th class="wa-tech" colspan="3">Technicals</th>
+      <th class="wa-fnd" colspan="4">Fundamentals</th>
+      <th class="wa-val" colspan="4">Valuation</th>
+      <th class="wa-final" colspan="3">Final</th>
+    </tr>
+    """
+
+    header_row_2_cells = []
+    # Left (2)
+    header_row_2_cells += [
+        '<th class="wa-left">Company</th>',
+        '<th class="wa-left">LTP</th>',
+    ]
+    # Technicals (3)
+    header_row_2_cells += [
+        '<th class="wa-tech">50DMA</th>',
+        '<th class="wa-tech">150DMA</th>',
+        '<th class="wa-tech">200DMA</th>',
+    ]
+    # Fundamentals (4)
+    header_row_2_cells += [
+        '<th class="wa-fnd">Sales growth % (YOY-3 years)</th>',
+        '<th class="wa-fnd">Profit growth % (YOY 3years)</th>',
+        '<th class="wa-fnd">ROE</th>',
+        '<th class="wa-fnd">ROCE</th>',
+    ]
+    # Valuation (4)
+    header_row_2_cells += [
+        '<th class="wa-val">VAL: PB</th>',
+        '<th class="wa-val">VAL: Fair</th>',
+        '<th class="wa-val">VAL: MoS Buy</th>',
+        '<th class="wa-val">VAL: Method</th>',
+    ]
+    # Final (3)
+    header_row_2_cells += [
+        '<th class="wa-final">Momentum</th>',
+        '<th class="wa-final">Recommendation</th>',
+        '<th class="wa-final">Reason</th>',
+    ]
+
+    header_row_2 = "<tr>" + "".join(header_row_2_cells) + "</tr>"
+
+    # Body rows
+    def td(val, cls="wa-num"):
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return f'<td class="{cls}">NA</td>'
+        return f'<td class="{cls}">{val}</td>'
+
+    body = ""
+    for _, r in df.iterrows():
+        body += "<tr>"
+        body += td(r["Company"], cls="wa-text")
+        body += td(r["LTP"])
+        body += td(r["50DMA"])
+        body += td(r["150DMA"])
+        body += td(r["200DMA"])
+        body += td(r["Sales growth % (YOY-3 years)"])
+        body += td(r["Profit growth % (YOY 3years)"])
+        body += td(r["ROE"])
+        body += td(r["ROCE"])
+        body += td(r["VAL: PB"])
+        body += td(r["VAL: Fair"])
+        body += td(r["VAL: MoS Buy"])
+        body += td(r["VAL: Method"], cls="wa-text")
+        body += td(r["Momentum"], cls="wa-text")
+        body += td(r["Recommendation"], cls="wa-text")
+        body += td(r["Reason"], cls="wa-text")
+        body += "</tr>"
+
+    html = f"""
+    {css}
+    <table class="wa-table">
+      <thead>
+        {header_row_1}
+        {header_row_2}
+      </thead>
+      <tbody>
+        {body}
+      </tbody>
+    </table>
+    """
+    return html
+
+
+# =========================
+# APP FLOW
+# =========================
 with st.sidebar:
     st.header("Settings")
-    mos_val = st.slider("Margin of Safety %", 5, 40, 20)
-    max_workers = st.slider("Parallel workers (Cloud-safe)", 1, 8, DEFAULT_MAX_WORKERS)
-    st.markdown("---")
-    st.caption("Tip: If you see many timeouts, reduce workers to 2–3.")
+    mos = st.slider("Margin of Safety %", 5, 40, 20)
+    workers = st.slider("Parallel workers", 1, 8, 4)
+    overall_timeout = st.slider("Overall fundamentals timeout (sec)", 20, 240, 90)
+    st.caption("If it feels slow or shows many timeouts, reduce workers to 2–3.")
 
-uploaded = st.file_uploader("Upload portfolio CSV (must include a symbol/ticker column)", type=["csv"])
+uploaded = st.file_uploader("Upload Portfolio CSV (must have Symbol/Ticker column)", type=["csv"])
 
 if uploaded:
     df = pd.read_csv(uploaded)
     df.columns = [c.lower().strip() for c in df.columns]
 
-    # Find symbol column
     tick_col = next((c for c in df.columns if "stock symbol" in c or "symbol" in c or "ticker" in c), None)
     name_col = next((c for c in df.columns if "company" in c or "name" in c), None)
 
     if not tick_col:
-        st.error("Could not find a symbol column. Use a column like: Stock Symbol / Symbol / Ticker")
+        st.error("Your CSV must contain a column like: Stock Symbol / Symbol / Ticker")
         st.stop()
 
     symbols = [normalize_symbol(x) for x in df[tick_col].dropna().astype(str).tolist()]
     symbols = [s for s in symbols if s]
+    name_map = {}
+    if name_col:
+        for _, r in df.iterrows():
+            sym = normalize_symbol(r.get(tick_col, ""))
+            nm = str(r.get(name_col, "")).strip()
+            if sym and nm:
+                name_map[sym] = nm
 
-    if st.button("🚀 Run Analysis (No Freeze)"):
-        st.info(f"Processing {len(symbols)} tickers…")
+    if st.button("🚀 RUN ANALYSIS"):
+        st.info(f"Running analysis for {len(symbols)} tickers…")
 
-        # 1) BULK PRICE FETCH (fast)
-        with st.spinner("Fetching price history (bulk)…"):
-            # group_by="ticker" gives multiindex columns for multiple tickers
-            prices = yf.download(
+        # -------- 1) BULK PRICE FETCH (FAST)
+        with st.spinner("Fetching prices (bulk)…"):
+            raw = yf.download(
                 tickers=" ".join(symbols),
                 period="1y",
                 interval="1d",
@@ -285,191 +428,210 @@ if uploaded:
                 progress=False,
             )
 
-        # Normalize prices into dict: sym -> close series
-        close_map = {}
-        if isinstance(prices.columns, pd.MultiIndex):
+        close_map: Dict[str, pd.Series] = {}
+        if isinstance(raw.columns, pd.MultiIndex):
             for sym in symbols:
-                if sym in prices.columns.get_level_values(0):
-                    s = prices[sym]["Close"].dropna()
+                if sym in raw.columns.get_level_values(0):
+                    s = raw[sym]["Close"].dropna()
                     if len(s) > 0:
                         close_map[sym] = s
         else:
-            # single ticker case
-            s = prices["Close"].dropna()
+            s = raw["Close"].dropna()
             if len(s) > 0:
                 close_map[symbols[0]] = s
 
-        # 2) Fundamentals fetch with timeout (parallel but safe)
-        results = []
-        success = 0
-        no_price = 0
-        timeouts = 0
-        errors = 0
-
-        progress = st.progress(0)
-        status = st.empty()
-
-        def process_one(sym: str) -> Dict:
-            # price-derived metrics
+        # Build base rows from price
+        base_rows = {}
+        for sym in symbols:
             close = close_map.get(sym)
             if close is None or len(close) < 210:
-                return {"Ticker": sym, "ERROR": "No price / insufficient history"}
+                base_rows[sym] = {
+                    "Company": name_map.get(sym, sym),
+                    "LTP": None,
+                    "50DMA": None,
+                    "150DMA": None,
+                    "200DMA": None,
+                }
+                continue
 
             ltp = float(close.iloc[-1])
             d50 = float(close.rolling(50).mean().iloc[-1])
             d150 = float(close.rolling(150).mean().iloc[-1])
             d200 = float(close.rolling(200).mean().iloc[-1])
 
-            # fundamentals (timeout-protected outside)
-            return {
-                "Ticker": sym,
-                "TECH: LTP": round(ltp, 2),
-                "TECH: 50DMA": round(d50, 2),
-                "TECH: 150DMA": round(d150, 2),
-                "TECH: 200DMA": round(d200, 2),
+            base_rows[sym] = {
+                "Company": name_map.get(sym, sym),
+                "LTP": round2(ltp),
+                "50DMA": round2(d50),
+                "150DMA": round2(d150),
+                "200DMA": round2(d200),
             }
 
-        # First build base rows from price
-        base_rows = {sym: process_one(sym) for sym in symbols}
+        # -------- 2) FUNDAMENTALS / VALUATION (BEST-EFFORT)
+        results: List[Dict] = []
+        progress = st.progress(0)
+        status = st.empty()
 
-        # Now enrich fundamentals using futures
-        with st.spinner("Fetching fundamentals (best-effort, timeout protected)…"):
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_map = {executor.submit(fetch_fundamentals, sym): sym for sym in symbols}
+        start_time = time.time()
+        completed = 0
 
-                completed = 0
-                for fut in as_completed(future_map):
-                    sym = future_map[fut]
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_map = {ex.submit(fetch_fundamentals, sym): sym for sym in symbols}
+
+            # We use overall timeout to avoid "forever waiting" if Yahoo hangs
+            try:
+                for fut in as_completed(fut_map, timeout=overall_timeout):
+                    sym = fut_map[fut]
                     completed += 1
-                    progress.progress(completed / len(symbols))
+                    progress.progress(min(1.0, completed / max(1, len(symbols))))
                     status.write(f"Fundamentals: {sym} ({completed}/{len(symbols)})")
 
-                    row = base_rows.get(sym, {"Ticker": sym})
+                    row = dict(base_rows.get(sym, {}))
 
-                    # If no price data, keep it and skip fundamentals
-                    if "ERROR" in row:
-                        no_price += 1
-                        results.append(row)
-                        continue
+                    # If no price, still output row with NA
+                    ltp = row.get("LTP")
+                    d50 = row.get("50DMA")
+                    d150 = row.get("150DMA")
+                    d200 = row.get("200DMA")
 
                     try:
-                        data = fut.result(timeout=FUNDAMENTALS_TIMEOUT_SEC)
+                        data = fut.result()
                         info = data.get("info", {}) or {}
                         sector = info.get("sector") or "Default"
 
+                        # Fundamentals
+                        sales_g = pct_fmt(data.get("sales_cagr"))
+                        prof_g = pct_fmt(data.get("profit_cagr"))
                         roe = safe_float(info.get("returnOnEquity"))
-                        roe_pct = round((roe * 100), 2) if roe is not None else None
+                        roe_pct = pct_fmt(roe * 100) if roe is not None else None
+                        roce = pct_fmt(data.get("roce"))
 
+                        # Valuation
                         pb = safe_float(info.get("priceToBook"))
-                        pb_val = round(pb, 2) if pb is not None else None
+                        pb_v = round2(pb) if pb is not None else None
 
-                        # Sales/profit growth CAGR 3Y best-effort
-                        sales_g = data.get("rev_cagr_3y")
-                        prof_g = data.get("profit_cagr_3y")
-                        roce = data.get("roce")
+                        fair, method_note = valuation_fair_price(info, sector)
+                        fair_v = round2(fair) if fair is not None else None
+                        mos_buy = round2(fair * (1 - mos / 100)) if fair is not None else None
 
-                        fair, val_note = valuation_fair_price(info, sector)
-                        mos_price = (fair * (1 - mos_val / 100)) if (fair is not None) else None
+                        # Final
+                        mom = None
+                        if all(v is not None for v in [ltp, d50, d150, d200]):
+                            mom = momentum_label(ltp, d50, d150, d200)
 
-                        mom = momentum_state(
-                            row["TECH: LTP"], row["TECH: 50DMA"], row["TECH: 150DMA"], row["TECH: 200DMA"]
-                        )
-
-                        # Final recommendation logic
-                        rec = "Neutral / Wait"
-                        if fair is None:
-                            rec = "Insufficient Data"
-                        else:
-                            if row["TECH: LTP"] <= mos_price and mom != "Bearish":
-                                rec = "Strong Buy / Add"
-                            elif row["TECH: LTP"] <= fair:
-                                rec = "Hold / Watch"
+                        # Recommendation + reason
+                        rec = "Insufficient Data"
+                        reason = "Missing fundamentals from data source"
+                        if fair is not None and ltp is not None:
+                            if mom == "Bearish" and ltp > (mos_buy or 0):
+                                rec = "Hold"
+                                reason = "Bearish momentum; wait for trend to stabilize"
+                            elif mos_buy is not None and ltp <= mos_buy and mom != "Bearish":
+                                rec = "Buy"
+                                reason = "Price below MoS buy + momentum not bearish"
+                            elif fair_v is not None and ltp <= fair_v:
+                                rec = "Hold"
+                                reason = "Near/under fair value; not at MoS yet"
                             else:
-                                rec = "Avoid / Expensive"
-
-                        # Confidence / coverage
-                        coverage = []
-                        if roe_pct is not None: coverage.append("ROE")
-                        if pb_val is not None: coverage.append("PB")
-                        if sales_g is not None: coverage.append("Sales3Y")
-                        if prof_g is not None: coverage.append("Profit3Y")
-                        if roce is not None: coverage.append("ROCE")
-                        coverage_str = ",".join(coverage) if coverage else "Price-only"
+                                rec = "Wait"
+                                reason = "Above fair value / no margin of safety"
 
                         row.update({
-                            "FND: Sector": sector,
-                            "FND: ROE": roe_pct,
-                            "FND: ROCE": round(roce, 2) if roce is not None else None,
-                            "FND: Sales growth % (YOY-3 years)": round(sales_g, 2) if sales_g is not None else None,
-                            "FND: Profit growth % (YOY 3years)": round(prof_g, 2) if prof_g is not None else None,
-                            "VAL: PB": pb_val,
-                            "VAL: Fair Price": round(fair, 2) if fair is not None else None,
-                            "VAL: MoS Buy": round(mos_price, 2) if mos_price is not None else None,
-                            "VAL: Method Note": val_note,
-                            "FINAL: Momentum": mom,
-                            "FINAL: Recommendation": rec,
-                            "FINAL: Data Coverage": coverage_str
+                            "Sales growth % (YOY-3 years)": sales_g,
+                            "Profit growth % (YOY 3years)": prof_g,
+                            "ROE": roe_pct,
+                            "ROCE": roce,
+                            "VAL: PB": pb_v,
+                            "VAL: Fair": fair_v,
+                            "VAL: MoS Buy": mos_buy,
+                            "VAL: Method": method_note,
+                            "Momentum": mom,
+                            "Recommendation": rec,
+                            "Reason": reason
                         })
 
-                        success += 1
-                        results.append(row)
-
-                    except TimeoutError:
-                        timeouts += 1
-                        row.update({
-                            "FND: Sector": None,
-                            "FINAL: Recommendation": "Timeout (Yahoo throttling)",
-                            "FINAL: Data Coverage": "Price-only"
-                        })
-                        results.append(row)
                     except Exception:
-                        errors += 1
                         row.update({
-                            "FND: Sector": None,
-                            "FINAL: Recommendation": "Error in fundamentals",
-                            "FINAL: Data Coverage": "Price-only"
+                            "Sales growth % (YOY-3 years)": None,
+                            "Profit growth % (YOY 3years)": None,
+                            "ROE": None,
+                            "ROCE": None,
+                            "VAL: PB": None,
+                            "VAL: Fair": None,
+                            "VAL: MoS Buy": None,
+                            "VAL: Method": "Error/NA",
+                            "Momentum": None,
+                            "Recommendation": "Hold",
+                            "Reason": "Fundamentals fetch failed; relying on technicals only"
                         })
-                        results.append(row)
+
+                    results.append(row)
+
+            except Exception:
+                # overall timeout hit — fill remaining as timeout
+                pending_syms = [s for s in symbols if s not in {r.get("Company") for r in results}]
+                # We'll just not hard-guess; table will still be complete from base_rows below.
+
+                pass
 
         status.empty()
         progress.empty()
 
-        res_df = pd.DataFrame(results)
+        # Ensure EVERY symbol is present in output
+        # (results might miss some if overall timeout triggers)
+        output_map = {r["Company"]: r for r in results if "Company" in r}
+        final_rows = []
+        for sym in symbols:
+            company = name_map.get(sym, sym)
+            if company in output_map:
+                final_rows.append(output_map[company])
+            else:
+                # fallback to price-only row
+                row = dict(base_rows.get(sym, {}))
+                row.update({
+                    "Sales growth % (YOY-3 years)": None,
+                    "Profit growth % (YOY 3years)": None,
+                    "ROE": None,
+                    "ROCE": None,
+                    "VAL: PB": None,
+                    "VAL: Fair": None,
+                    "VAL: MoS Buy": None,
+                    "VAL: Method": "Timeout/NA",
+                    "Momentum": None,
+                    "Recommendation": "Hold",
+                    "Reason": "Timeout fetching fundamentals; price-only"
+                })
+                final_rows.append(row)
 
-        # Attach company name if present in uploaded file
-        if name_col:
-            # make a mapping for display
-            m = {}
-            for _, r in df.iterrows():
-                sym = normalize_symbol(r.get(tick_col, ""))
-                nm = r.get(name_col, "")
-                if sym and nm:
-                    m[sym] = nm
-            res_df.insert(0, "Company", res_df["Ticker"].map(m).fillna(res_df["Ticker"]))
+        # EXACT column order (as your template)
+        out = pd.DataFrame(final_rows)[[
+            "Company",
+            "LTP",
+            "50DMA",
+            "150DMA",
+            "200DMA",
+            "Sales growth % (YOY-3 years)",
+            "Profit growth % (YOY 3years)",
+            "ROE",
+            "ROCE",
+            "VAL: PB",
+            "VAL: Fair",
+            "VAL: MoS Buy",
+            "VAL: Method",
+            "Momentum",
+            "Recommendation",
+            "Reason"
+        ]]
 
-        # Make columns order friendly
-        preferred = [c for c in [
-            "Company", "Ticker",
-            "TECH: LTP", "TECH: 50DMA", "TECH: 150DMA", "TECH: 200DMA",
-            "FND: Sector", "FND: Sales growth % (YOY-3 years)", "FND: Profit growth % (YOY 3years)",
-            "FND: ROE", "FND: ROCE",
-            "VAL: PB", "VAL: Fair Price", "VAL: MoS Buy", "VAL: Method Note",
-            "FINAL: Momentum", "FINAL: Recommendation", "FINAL: Data Coverage",
-            "ERROR"
-        ] if c in res_df.columns]
+        st.success(f"Analysis complete in ~{int(time.time() - start_time)}s")
 
-        res_df = res_df[preferred] if preferred else res_df
+        # Render EXACT UI layout
+        st.markdown(render_grouped_table(out), unsafe_allow_html=True)
 
-        st.success(
-            f"Done. Success: {success} | No-price: {no_price} | Timeouts: {timeouts} | Errors: {errors}"
-        )
-
-        st.dataframe(res_df, use_container_width=True, hide_index=True)
-
-        csv_bytes = res_df.to_csv(index=False).encode("utf-8")
+        # Download
         st.download_button(
             "Download results (CSV)",
-            data=csv_bytes,
+            data=out.to_csv(index=False).encode("utf-8"),
             file_name="wealth_architect_results.csv",
             mime="text/csv",
         )
@@ -477,7 +639,6 @@ if uploaded:
 st.markdown("---")
 st.markdown(
     "### Notes\n"
-    "- **Sales/Profit growth & ROCE** depend on Yahoo providing financial statements for the ticker. For many NSE stocks, Yahoo sometimes returns **blank**.\n"
-    "- The app will still work using **DMA + momentum + best-effort valuation**.\n"
-    "- If you see many **Timeouts**, reduce parallel workers to **2–3** and re-run.\n"
+    "- For many NSE tickers, Yahoo sometimes returns **NA** for financial statements; in that case we still output the row using price-based technicals.\n"
+    "- If the app feels slow, reduce **Parallel workers** to 2–3.\n"
 )
