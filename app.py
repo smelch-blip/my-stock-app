@@ -1,17 +1,19 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 # =========================
 # UI + CONFIG
 # =========================
 st.set_page_config(layout="wide", page_title="Wealth Architect Pro (NSE)")
 st.title("🏛️ Wealth Architect Pro")
-st.caption("NSE-only portfolio audit using Yahoo Finance (free). Includes technicals, fundamentals (best-effort), and sector-aware valuation bands.")
+st.caption("NSE-only portfolio audit using Yahoo Finance (free). Includes technicals, fundamentals (best-effort), and sector-aware valuation.")
 
-# IMPORTANT: You asked for exact column names + order
+# EXACT output columns & order (must be a LIST, not a set)
 OUTPUT_COLUMNS = [
     "Company",
     "LTP",
@@ -31,498 +33,542 @@ OUTPUT_COLUMNS = [
     "Reason",
 ]
 
-# Sector-aware valuation bands (India-leaning heuristics)
-# You can fine-tune these later once you see results.
-SECTOR_BANDS = {
-    # Banks/NBFCs typically better handled by P/B
-    "Financial Services": {"method": "PB", "min": 1.0, "max": 3.0},
-    # IT/services can carry higher P/E
-    "Technology": {"method": "PE", "min": 18, "max": 40},
-    "Communication Services": {"method": "PE", "min": 15, "max": 35},
-    # Staples / FMCG often higher
-    "Consumer Defensive": {"method": "PE", "min": 25, "max": 55},
-    # Cyclical consumer (auto, discretionary): keep tighter than 30 blanket
-    "Consumer Cyclical": {"method": "PE", "min": 10, "max": 22},
-    # Cyclicals/materials: use normalized PE, lower band
-    "Basic Materials": {"method": "CYCLICAL_PE", "min": 6, "max": 14},
-    "Energy": {"method": "CYCLICAL_PE", "min": 6, "max": 14},
-    "Industrials": {"method": "PE", "min": 12, "max": 25},
-    "Utilities": {"method": "PE", "min": 10, "max": 18},
-    "Healthcare": {"method": "PE", "min": 18, "max": 35},
-    "Real Estate": {"method": "CYCLICAL_PE", "min": 8, "max": 18},
-    "Default": {"method": "PE", "min": 12, "max": 22},
+# Sector valuation defaults (simple + explainable)
+SECTOR_DEFAULTS = {
+    "Financial Services": {"method": "P/B", "target_pb": 2.2},
+    "Technology": {"method": "P/E", "target_pe": 28.0},
+    "Consumer Defensive": {"method": "P/E", "target_pe": 40.0},
+    "Consumer Cyclical": {"method": "P/E", "target_pe": 30.0},
+    "Healthcare": {"method": "P/E", "target_pe": 35.0},
+    "Industrials": {"method": "DEBT_ADJ_PE", "target_pe": 22.0},
+    "Utilities": {"method": "CYCLICAL_PE", "target_pe": 14.0},
+    "Energy": {"method": "CYCLICAL_PE", "target_pe": 10.0},
+    "Basic Materials": {"method": "CYCLICAL_PE", "target_pe": 12.0},
+    "Real Estate": {"method": "DEBT_ADJ_PE", "target_pe": 18.0},
+    "Communication Services": {"method": "P/E", "target_pe": 20.0},
+    "Default": {"method": "P/E", "target_pe": 20.0},
 }
 
 # =========================
-# HELPERS
+# Helpers
 # =========================
 def _as_float(x):
     try:
         if x is None:
             return None
-        if isinstance(x, (np.floating, float, int)):
+        if isinstance(x, (int, float, np.floating)):
             return float(x)
-        return float(str(x))
+        x = str(x).replace(",", "").strip()
+        if x == "" or x.lower() in {"nan", "none", "na"}:
+            return None
+        return float(x)
     except Exception:
         return None
 
+def _fmt(x, nd=2):
+    v = _as_float(x)
+    if v is None or np.isnan(v):
+        return "NA"
+    return round(v, nd)
+
+def _pct_fmt(x, nd=2):
+    v = _as_float(x)
+    if v is None or np.isnan(v):
+        return "NA"
+    return round(v, nd)
+
 def _clean_nse_symbol(sym: str) -> str:
     s = str(sym).strip().upper()
-    if not s:
+    if s == "" or s.lower() == "nan":
         return ""
-    # NSE-only:
+    # If user already passed .NS or .BO, keep it
     if "." not in s:
-        s += ".NS"
-    # If someone gives .BO etc, keep it but this app is meant for NSE
+        s = s + ".NS"
     return s
 
+def _pick_col(df: pd.DataFrame, candidates):
+    cols = {c.lower().strip(): c for c in df.columns}
+    for cand in candidates:
+        if cand in cols:
+            return cols[cand]
+    # fallback: any column containing keyword
+    for c in df.columns:
+        cl = c.lower().strip()
+        for cand in candidates:
+            if cand in cl:
+                return c
+    return None
+
 def _safe_div(a, b):
+    a = _as_float(a)
+    b = _as_float(b)
     if a is None or b is None or b == 0:
         return None
     return a / b
 
 def _cagr(v0, v1, years: float):
+    v0 = _as_float(v0)
+    v1 = _as_float(v1)
     if v0 is None or v1 is None or v0 <= 0 or v1 <= 0 or years <= 0:
         return None
     return (v1 / v0) ** (1.0 / years) - 1.0
 
-def _pick_ticker_col(df: pd.DataFrame) -> str | None:
-    cols = [c.lower().strip() for c in df.columns]
-    for key in ["stock symbol", "ticker", "symbol"]:
-        if key in cols:
-            return df.columns[cols.index(key)]
-    # fallback: any column containing symbol/ticker
-    for c in df.columns:
-        cl = c.lower()
-        if "symbol" in cl or "ticker" in cl:
-            return c
+def _latest_from_stmt(stmt: pd.DataFrame, row_names):
+    """Return latest value for any of row_names from financial statement dataframe."""
+    if stmt is None or not isinstance(stmt, pd.DataFrame) or stmt.empty:
+        return None
+    for rn in row_names:
+        if rn in stmt.index:
+            series = stmt.loc[rn]
+            if hasattr(series, "dropna"):
+                series = series.dropna()
+            if len(series) == 0:
+                continue
+            # columns are dates, pick latest by column
+            try:
+                # ensure columns sortable
+                cols = list(series.index)
+                # series is indexed by columns (dates)
+                # take first element from the left? safer: take max column label
+                # But yfinance often orders newest->oldest; still, choose the first non-null after sorting
+                return float(series.iloc[0])
+            except Exception:
+                try:
+                    return float(series.values[0])
+                except Exception:
+                    return None
     return None
 
-def _get_company_name(row, fallback):
-    for k in ["company", "company name", "name"]:
-        if k in row.index:
-            v = row.get(k)
-            if pd.notna(v) and str(v).strip():
-                return str(v).strip()
-    return fallback
+def _get_annual_series(stmt: pd.DataFrame, row_names):
+    """Return a list of (date, value) for the first matching row_name."""
+    if stmt is None or not isinstance(stmt, pd.DataFrame) or stmt.empty:
+        return []
+    for rn in row_names:
+        if rn in stmt.index:
+            s = stmt.loc[rn]
+            if isinstance(s, pd.Series):
+                s = s.dropna()
+                # s index = columns (dates)
+                out = []
+                for k, v in s.items():
+                    try:
+                        out.append((k, float(v)))
+                    except Exception:
+                        continue
+                # try to sort by date descending
+                try:
+                    out = sorted(out, key=lambda x: str(x[0]), reverse=True)
+                except Exception:
+                    pass
+                return out
+    return []
 
-# =========================
-# DATA FETCH (CACHED)
-# =========================
-@st.cache_data(ttl=60 * 30)  # 30 mins
-def fetch_yahoo_bundle(symbol: str):
+def _compute_3y_growth_from_stmt(stmt: pd.DataFrame, row_names):
     """
-    Returns a dict with:
-    - info (dict)
-    - hist (DataFrame)
-    - financials (annual income statement)
-    - balance_sheet (annual balance sheet)
+    Best-effort 3Y CAGR using annual statement:
+    need >= 4 annual points (current vs 3 years ago).
+    Returns percent (0-100) or None.
     """
-    t = yf.Ticker(symbol)
-
-    # history: we need >= 200 trading days for 200DMA; keep 2y buffer.
-    hist = t.history(period="2y", auto_adjust=False)
-
-    # info: can be slow, but required for sector/roe/pb/eps
-    info = t.info or {}
-
-    # annual statements (best-effort)
-    # yfinance provides annual financials/balance_sheet in many cases, not always for NSE.
-    financials = getattr(t, "financials", None)
-    balance_sheet = getattr(t, "balance_sheet", None)
-
-    return {
-        "info": info,
-        "hist": hist,
-        "financials": financials,
-        "balance_sheet": balance_sheet,
-    }
-
-# =========================
-# METRIC COMPUTATION
-# =========================
-def compute_dmas(hist: pd.DataFrame):
-    if hist is None or hist.empty or "Close" not in hist.columns:
-        return None, None, None, None
-
-    close = hist["Close"].dropna()
-    if len(close) < 210:
-        return None, None, None, None
-
-    ltp = float(close.iloc[-1])
-    d50 = float(close.rolling(50).mean().iloc[-1])
-    d150 = float(close.rolling(150).mean().iloc[-1])
-    d200 = float(close.rolling(200).mean().iloc[-1])
-    return ltp, d50, d150, d200
-
-def compute_3y_growth_from_financials(financials: pd.DataFrame):
-    """
-    Returns (sales_cagr_3y_pct, profit_cagr_3y_pct)
-    - Uses Total Revenue and Net Income if available
-    - Needs at least 4 annual points to compute 3-year CAGR cleanly.
-    """
-    if financials is None or not isinstance(financials, pd.DataFrame) or financials.empty:
-        return None, None
-
-    # financials are typically rows x columns (years)
-    cols = list(financials.columns)
-    if len(cols) < 4:
-        # not enough years for 3y CAGR
-        return None, None
-
-    # Ensure chronological order (oldest -> newest)
-    cols_sorted = sorted(cols)
-    fin = financials[cols_sorted]
-
-    def _get_row_any(names):
-        for n in names:
-            if n in fin.index:
-                return fin.loc[n].astype(float).values
+    series = _get_annual_series(stmt, row_names)
+    if len(series) < 4:
         return None
-
-    rev = _get_row_any(["Total Revenue", "TotalRevenue", "totalRevenue"])
-    pat = _get_row_any(["Net Income", "NetIncome", "netIncome"])
-
-    # pick 3-year span: oldest among last 4 vs newest
-    # last 4 points => years diff ~3
-    def _cagr_last4(arr):
-        if arr is None or len(arr) < 4:
-            return None
-        v0 = _as_float(arr[-4])
-        v1 = _as_float(arr[-1])
-        g = _cagr(v0, v1, 3.0)
-        return None if g is None else g * 100
-
-    sales = _cagr_last4(rev)
-    profit = _cagr_last4(pat)
-    return sales, profit
-
-def compute_roce(financials: pd.DataFrame, balance_sheet: pd.DataFrame):
-    """
-    Approx ROCE (%) = EBIT / (Total Assets - Current Liabilities) * 100
-    Best-effort; returns None if data lines missing.
-    """
-    if financials is None or balance_sheet is None:
+    # Use latest and the 4th point as ~3 years ago
+    latest_val = series[0][1]
+    old_val = series[3][1]
+    g = _cagr(old_val, latest_val, 3.0)
+    if g is None:
         return None
-    if not isinstance(financials, pd.DataFrame) or not isinstance(balance_sheet, pd.DataFrame):
-        return None
-    if financials.empty or balance_sheet.empty:
-        return None
+    return g * 100
 
-    # Align to latest common column (year)
-    fin_cols = sorted(list(financials.columns))
-    bs_cols = sorted(list(balance_sheet.columns))
-    if not fin_cols or not bs_cols:
-        return None
-
-    latest = min(fin_cols[-1], bs_cols[-1])  # safest intersection-ish
-    if latest not in financials.columns or latest not in balance_sheet.columns:
-        return None
-
-    fin = financials[latest]
-    bs = balance_sheet[latest]
-
-    ebit = None
-    for k in ["EBIT", "Ebit", "Operating Income", "OperatingIncome"]:
-        if k in fin.index:
-            ebit = _as_float(fin.loc[k])
-            break
-
-    total_assets = None
-    for k in ["Total Assets", "TotalAssets"]:
-        if k in bs.index:
-            total_assets = _as_float(bs.loc[k])
-            break
-
-    current_liab = None
-    for k in ["Total Current Liabilities", "TotalCurrentLiabilities"]:
-        if k in bs.index:
-            current_liab = _as_float(bs.loc[k])
-            break
-
-    capital_employed = None
-    if total_assets is not None and current_liab is not None:
-        capital_employed = total_assets - current_liab
-
-    roce = _safe_div(ebit, capital_employed)
-    return None if roce is None else roce * 100
-
-def sector_cfg_from_info(info: dict):
-    sector = info.get("sector") or "Default"
-    cfg = SECTOR_BANDS.get(sector, SECTOR_BANDS["Default"])
-    return sector, cfg
-
-def compute_valuation(info: dict, sector: str, cfg: dict, sales_g_3y, profit_g_3y, roe_pct, ltp, mos_pct):
-    """
-    Returns:
-    - pb
-    - fair
-    - mos_buy
-    - method_str
-    """
-    pb = _as_float(info.get("priceToBook"))
-    book_value = _as_float(info.get("bookValue"))
-
-    trailing_eps = _as_float(info.get("trailingEps"))
-    forward_eps = _as_float(info.get("forwardEps"))
-    eps = forward_eps if (forward_eps is not None and forward_eps > 0) else trailing_eps
-
-    method = cfg["method"]
-    fair = None
-    method_str = ""
-
-    # Small “quality tilt” for multiple within band:
-    # use ROE + growth (3y if available) but keep bounded.
-    growth_used = None
-    if profit_g_3y is not None and np.isfinite(profit_g_3y):
-        growth_used = profit_g_3y
-    elif sales_g_3y is not None and np.isfinite(sales_g_3y):
-        growth_used = sales_g_3y
-
-    base_mult = (cfg["min"] + cfg["max"]) / 2
-
-    # Adjust multiple modestly (avoid huge skews)
-    adj = 1.0
-    if roe_pct is not None:
-        if roe_pct >= 18:
-            adj *= 1.10
-        elif roe_pct <= 10:
-            adj *= 0.90
-
-    if growth_used is not None:
-        if growth_used >= 20:
-            adj *= 1.10
-        elif growth_used <= 8:
-            adj *= 0.90
-
-    mult = base_mult * adj
-    mult = max(cfg["min"], min(cfg["max"], mult))
-
-    if method == "PB":
-        # For PB, need book value
-        if book_value is not None and book_value > 0:
-            fair = book_value * mult
-            method_str = f"P/B (band {cfg['min']}-{cfg['max']}, used {mult:.2f})"
-        else:
-            fair = None
-            method_str = "P/B (book value missing)"
-    elif method == "CYCLICAL_PE":
-        # For cyclicals: normalize EPS with haircut
-        if eps is not None and eps > 0:
-            norm_eps = eps * 0.8
-            fair = norm_eps * mult
-            method_str = f"CYCLICAL_PE (0.8×EPS, band {cfg['min']}-{cfg['max']}, used {mult:.2f})"
-        else:
-            fair = None
-            method_str = "CYCLICAL_PE (EPS missing)"
-    else:
-        # Standard PE
-        if eps is not None and eps > 0:
-            fair = eps * mult
-            method_str = f"P/E (band {cfg['min']}-{cfg['max']}, used {mult:.2f})"
-        else:
-            fair = None
-            method_str = "P/E (EPS missing)"
-
-    mos_buy = None
-    if fair is not None:
-        mos_buy = fair * (1 - mos_pct / 100.0)
-
-    # If pb missing, try compute from book value
-    if pb is None and book_value is not None and book_value > 0 and ltp is not None:
-        pb = ltp / book_value
-
-    return pb, fair, mos_buy, method_str
-
-def compute_momentum(ltp, d50, d200):
+def _momentum_state(ltp, d50, d200):
+    ltp = _as_float(ltp)
+    d50 = _as_float(d50)
+    d200 = _as_float(d200)
     if ltp is None or d50 is None or d200 is None:
-        return "Neutral"
+        return "NA"
     if ltp > d50 > d200:
         return "Bullish"
-    if (ltp < d200) and (d50 < d200):
+    if d50 < d200 or ltp < d200:
         return "Bearish"
     return "Neutral"
 
-def final_reco(momentum, ltp, fair, mos_buy):
+def _valuation(symbol, info, roe_pct, pb):
     """
-    Keep it simple for business usage:
-    - Buy if below MoS and not bearish
-    - Hold if under fair (or near)
-    - Sell/Avoid if far above fair or bearish + above fair
+    Returns:
+      fair_price, method_str, rationale_str
     """
+    sector = (info.get("sector") or "Default")
+    cfg = SECTOR_DEFAULTS.get(sector, SECTOR_DEFAULTS["Default"])
+
+    # EPS choices
+    eps_fwd = _as_float(info.get("forwardEps"))
+    eps_ttm = _as_float(info.get("trailingEps"))
+    eps_use = eps_fwd if (eps_fwd is not None and eps_fwd > 0) else eps_ttm
+
+    # Book value
+    book_value = _as_float(info.get("bookValue"))
+
+    # Net debt / EBITDA (for debt adjusted)
+    total_debt = _as_float(info.get("totalDebt"))
+    total_cash = _as_float(info.get("totalCash"))
+    ebitda = _as_float(info.get("ebitda"))
+    net_debt_to_ebitda = None
+    if total_debt is not None and total_cash is not None and ebitda is not None and ebitda > 0:
+        net_debt_to_ebitda = (total_debt - total_cash) / ebitda
+
+    method = cfg["method"]
+    rationale = []
+    fair = None
+
+    if method == "P/B":
+        # Fair PB based on target_pb adjusted by ROE (very simple heuristic)
+        target_pb = _as_float(cfg.get("target_pb")) or 2.2
+        roe = _as_float(roe_pct)
+        adj = 1.0
+        if roe is not None:
+            if roe >= 18:
+                adj = 1.10
+            elif roe <= 10:
+                adj = 0.85
+        fair_pb = target_pb * adj
+        if book_value is not None and book_value > 0:
+            fair = book_value * fair_pb
+            rationale.append(f"P/B method: BookValue×FairPB ({round(fair_pb,2)}x)")
+        else:
+            rationale.append("P/B method: BookValue missing")
+    elif method == "CYCLICAL_PE":
+        # Normalize EPS with haircut to avoid peak earnings overvaluation
+        target_pe = _as_float(cfg.get("target_pe")) or 12.0
+        if eps_use is not None and eps_use > 0:
+            norm_eps = eps_use * 0.80
+            fair = norm_eps * target_pe
+            rationale.append(f"Cyclical P/E: (0.8×EPS)×{round(target_pe,2)}")
+        else:
+            rationale.append("Cyclical P/E: EPS missing")
+    elif method == "DEBT_ADJ_PE":
+        target_pe = _as_float(cfg.get("target_pe")) or 20.0
+        penalty = 1.0
+        if net_debt_to_ebitda is not None:
+            if net_debt_to_ebitda > 3:
+                penalty = 0.80
+                rationale.append(f"Debt penalty: NetDebt/EBITDA={round(net_debt_to_ebitda,2)} (>3)")
+            else:
+                rationale.append(f"Debt OK: NetDebt/EBITDA={round(net_debt_to_ebitda,2)}")
+        else:
+            rationale.append("Debt metric NA")
+        if eps_use is not None and eps_use > 0:
+            fair = eps_use * target_pe * penalty
+            rationale.append(f"Debt-adj P/E: EPS×{round(target_pe,2)}×{round(penalty,2)}")
+        else:
+            rationale.append("Debt-adj P/E: EPS missing")
+    else:
+        target_pe = _as_float(cfg.get("target_pe")) or 20.0
+        if eps_use is not None and eps_use > 0:
+            fair = eps_use * target_pe
+            rationale.append(f"P/E method: EPS×{round(target_pe,2)}")
+        else:
+            rationale.append("P/E method: EPS missing")
+
+    # Include PB as a reported metric even if method isn't PB
+    method_str = f"{method} | Sector={sector}"
+    return fair, method_str, " ; ".join(rationale)
+
+def _recommendation(ltp, d50, d200, fair, mos_buy, roe, roce):
+    """
+    Returns: recommendation, reason
+    """
+    mom = _momentum_state(ltp, d50, d200)
+
+    ltp = _as_float(ltp)
+    fair = _as_float(fair)
+    mos_buy = _as_float(mos_buy)
+    roe = _as_float(roe)
+    roce = _as_float(roce)
+
+    quality_good = False
+    if roe is not None and roce is not None:
+        quality_good = (roe >= 12 and roce >= 12)
+    elif roe is not None:
+        quality_good = (roe >= 12)
+
     if ltp is None:
-        return "Hold", "Price missing"
+        return "Hold", "Price data missing"
 
     if fair is None or mos_buy is None:
-        return "Hold", "Insufficient valuation data (EPS/book value missing)"
+        # Can't value -> default to momentum + trend guardrails
+        if mom == "Bearish":
+            return "Sell", "Bearish trend & insufficient valuation data"
+        if mom == "Bullish":
+            return "Hold", "Bullish trend but valuation data NA"
+        return "Hold", "Valuation data NA"
 
-    if (ltp <= mos_buy) and (momentum != "Bearish"):
-        return "Buy", "Price below MoS buy + momentum not bearish"
+    # Value + trend combined
+    if ltp <= mos_buy and mom != "Bearish":
+        if quality_good:
+            return "Buy", "Price below MoS Buy + trend not bearish + quality OK"
+        return "Buy", "Price below MoS Buy + trend not bearish"
     if ltp <= fair:
-        return "Hold", "Near/under fair value; not at MoS yet"
-    if momentum == "Bearish" and ltp > fair:
-        return "Sell", "Bearish trend + above fair value"
-    return "Hold", "Above fair value (wait for better entry)"
+        if mom == "Bearish":
+            return "Hold", "Valuation supportive but trend bearish (wait)"
+        return "Hold", "Valuation supportive (near/under Fair)"
+    # Over fair
+    if mom == "Bearish":
+        return "Sell", "Over Fair + bearish trend"
+    return "Hold", "Over Fair (no margin of safety)"
 
 # =========================
-# UI
+# Data Fetch (cached)
+# =========================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yahoo_bundle(symbol: str):
+    """
+    Best-effort fetch for NSE tickers:
+      - info
+      - 2y history for DMAs
+      - annual income stmt + balance sheet (if available)
+    """
+    t = yf.Ticker(symbol)
+
+    # INFO (can be slow/missing; keep it safe)
+    try:
+        info = t.info or {}
+    except Exception:
+        info = {}
+
+    # PRICE HISTORY
+    try:
+        hist = t.history(period="2y", auto_adjust=False)
+    except Exception:
+        hist = pd.DataFrame()
+
+    # FINANCIALS (annual)
+    income = None
+    balance = None
+    try:
+        # yfinance versions differ: try a few
+        if hasattr(t, "income_stmt"):
+            income = t.income_stmt
+        elif hasattr(t, "financials"):
+            income = t.financials
+    except Exception:
+        income = None
+
+    try:
+        if hasattr(t, "balance_sheet"):
+            balance = t.balance_sheet
+    except Exception:
+        balance = None
+
+    return info, hist, income, balance
+
+def compute_dmas(hist: pd.DataFrame):
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return None, None, None, None
+    close = hist["Close"].dropna()
+    if len(close) < 210:
+        # need enough for 200DMA
+        ltp = close.iloc[-1] if len(close) > 0 else None
+        d50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
+        d150 = close.rolling(150).mean().iloc[-1] if len(close) >= 150 else None
+        d200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else None
+        return ltp, d50, d150, d200
+    ltp = close.iloc[-1]
+    d50 = close.rolling(50).mean().iloc[-1]
+    d150 = close.rolling(150).mean().iloc[-1]
+    d200 = close.rolling(200).mean().iloc[-1]
+    return ltp, d50, d150, d200
+
+def compute_roce(info: dict, income: pd.DataFrame, balance: pd.DataFrame):
+    """
+    ROCE best-effort:
+      EBIT / (Total Assets - Current Liabilities)
+    Uses latest annual values if available.
+    """
+    # EBIT
+    ebit = None
+    if income is not None and isinstance(income, pd.DataFrame) and not income.empty:
+        ebit = _latest_from_stmt(income, ["EBIT", "Ebit", "Operating Income", "OperatingIncome"])
+    # If EBIT missing, try operating income from info (rare)
+    if ebit is None:
+        ebit = info.get("ebitda")  # not EBIT but better than nothing; flagged by NA if fails
+
+    # Capital employed
+    cap_emp = None
+    if balance is not None and isinstance(balance, pd.DataFrame) and not balance.empty:
+        total_assets = _latest_from_stmt(balance, ["Total Assets", "TotalAssets"])
+        curr_liab = _latest_from_stmt(balance, ["Total Current Liabilities", "Current Liabilities", "TotalCurrentLiabilities", "CurrentLiabilities"])
+        if total_assets is not None and curr_liab is not None:
+            cap_emp = total_assets - curr_liab
+
+    if ebit is None or cap_emp is None:
+        return None
+
+    roce = _safe_div(ebit, cap_emp)
+    if roce is None:
+        return None
+    return roce * 100
+
+def analyze_one(symbol: str, company_name: str, mos_pct: float):
+    # bundle
+    info, hist, income, balance = fetch_yahoo_bundle(symbol)
+
+    # dmAs
+    ltp, d50, d150, d200 = compute_dmas(hist)
+
+    # fundamentals
+    roe = info.get("returnOnEquity")
+    roe_pct = (roe * 100) if isinstance(roe, (int, float, np.floating)) else None
+
+    roce_pct = compute_roce(info, income, balance)
+
+    # revenue/profit growth (3Y CAGR best-effort)
+    sales_g_3y = _compute_3y_growth_from_stmt(income, ["Total Revenue", "TotalRevenue", "Revenue"])
+    profit_g_3y = _compute_3y_growth_from_stmt(income, ["Net Income", "NetIncome", "Net Income Common Stockholders", "NetIncomeCommonStockholders"])
+
+    # PB
+    pb = info.get("priceToBook")
+
+    # valuation
+    fair, val_method, val_rationale = _valuation(symbol, info, roe_pct, pb)
+    mos_buy = (fair * (1 - mos_pct / 100)) if _as_float(fair) is not None else None
+
+    # momentum
+    momentum = _momentum_state(ltp, d50, d200)
+
+    # final reco
+    reco, reason = _recommendation(ltp, d50, d200, fair, mos_buy, roe_pct, roce_pct)
+
+    # add valuation rationale into reason if useful
+    if val_rationale and val_rationale != "NA":
+        reason = f"{reason} | {val_rationale}"
+
+    row = {
+        "Company": company_name if company_name else symbol,
+        "LTP": _fmt(ltp),
+        "50DMA": _fmt(d50),
+        "150DMA": _fmt(d150),
+        "200DMA": _fmt(d200),
+        "Sales growth % (YOY-3 years)": _pct_fmt(sales_g_3y),
+        "Profit growth % (YOY 3years)": _pct_fmt(profit_g_3y),
+        "ROE": _pct_fmt(roe_pct),
+        "ROCE": _pct_fmt(roce_pct),
+        "VAL: PB": _fmt(pb),
+        "VAL: Fair": _fmt(fair),
+        "VAL: MoS Buy": _fmt(mos_buy),
+        "VAL: Method": val_method if val_method else "NA",
+        "Momentum": momentum,
+        "Recommendation": reco,
+        "Reason": reason,
+    }
+
+    # ensure exact columns exist
+    return {k: row.get(k, "NA") for k in OUTPUT_COLUMNS}
+
+def style_reco(val):
+    v = str(val).lower()
+    if v == "buy":
+        return "color:#16a34a;font-weight:700"  # green
+    if v == "sell":
+        return "color:#dc2626;font-weight:700"  # red
+    return "color:#b45309;font-weight:700"      # amber
+
+# =========================
+# UI Controls
 # =========================
 with st.sidebar:
     st.header("Settings")
-    mos = st.slider("Margin of Safety %", 5, 40, 20)
-    st.caption("Note: Sales/Profit growth are computed as 3-year CAGR if annual statements exist on Yahoo; otherwise left blank.")
+    mos_pct = st.slider("Margin of Safety %", 5, 40, 20)
+    max_workers = st.slider("Speed (parallel workers)", 2, 12, 6)
+    st.caption("Higher workers = faster, but Yahoo can throttle. If it stalls, reduce workers.")
 
-uploaded = st.file_uploader("Upload Portfolio CSV (NSE)", type=["csv"])
+uploaded = st.file_uploader("Upload Portfolio CSV/XLSX", type=["csv", "xlsx"])
 
-if not uploaded:
-    st.stop()
+if uploaded:
+    try:
+        df = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
+    except Exception as e:
+        st.error(f"Could not read file: {e}")
+        st.stop()
 
-df = pd.read_csv(uploaded)
-df.columns = [c.strip() for c in df.columns]
+    df.columns = [c.lower().strip() for c in df.columns]
 
-tick_col = _pick_ticker_col(df)
-if not tick_col:
-    st.error("Your CSV must contain a column named like: stock symbol / ticker / symbol")
-    st.stop()
+    ticker_col = _pick_col(df, ["stock symbol", "symbol", "ticker", "nse", "code"])
+    company_col = _pick_col(df, ["company", "company name", "name"])
 
-run = st.button("🚀 RUN ANALYSIS")
-if not run:
-    st.stop()
+    if not ticker_col:
+        st.error("Could not find a ticker column. Please include a column like: 'stock symbol' or 'ticker' or 'symbol'.")
+        st.stop()
 
-tickers = df[tick_col].dropna().astype(str).tolist()
-tickers = [_clean_nse_symbol(t) for t in tickers if str(t).strip()]
+    st.success(f"Loaded {len(df)} rows. Using ticker column: '{ticker_col}'" + (f", company column: '{company_col}'" if company_col else ""))
 
-if not tickers:
-    st.error("No tickers found in your file.")
-    st.stop()
+    if st.button("🚀 RUN ANALYSIS"):
+        tickers = []
+        for _, r in df.iterrows():
+            t = _clean_nse_symbol(r.get(ticker_col, ""))
+            if t:
+                comp = str(r.get(company_col, "")).strip() if company_col else t
+                tickers.append((t, comp))
 
-status = st.empty()
-progress = st.progress(0)
+        # de-dup by ticker, keep first company name
+        seen = set()
+        unique = []
+        for t, c in tickers:
+            if t not in seen:
+                unique.append((t, c))
+                seen.add(t)
 
-results = []
+        if not unique:
+            st.warning("No valid tickers found.")
+            st.stop()
 
-# Small parallelism to reduce "stuck" feeling; keep low to avoid Yahoo throttling
-MAX_WORKERS = 4
+        st.info(f"Analyzing {len(unique)} tickers…")
+        progress = st.progress(0)
+        status = st.empty()
 
-def process_one(idx, raw_sym):
-    sym = _clean_nse_symbol(raw_sym)
-    bundle = fetch_yahoo_bundle(sym)
-    info = bundle["info"] or {}
-    hist = bundle["hist"]
-    financials = bundle["financials"]
-    balance_sheet = bundle["balance_sheet"]
+        results = []
+        done = 0
 
-    ltp, d50, d150, d200 = compute_dmas(hist)
+        # parallel fetch to avoid "stuck" feel
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {}
+            for t, c in unique:
+                futures[ex.submit(analyze_one, t, c, mos_pct)] = t
 
-    sector, cfg = sector_cfg_from_info(info)
+            for fut in as_completed(futures):
+                t = futures[fut]
+                try:
+                    row = fut.result()
+                    if row:
+                        results.append(row)
+                except Exception as e:
+                    # keep a row with NA but don't crash
+                    results.append({k: ("NA" if k != "Company" else t) for k in OUTPUT_COLUMNS})
+                done += 1
+                status.write(f"Processed: {t} ({done}/{len(unique)})")
+                progress.progress(done / len(unique))
 
-    # Growth (3y CAGR) from annual financials (best effort)
-    sales_g3, profit_g3 = compute_3y_growth_from_financials(financials)
+        status.empty()
 
-    # ROE (Yahoo is decimal)
-    roe = info.get("returnOnEquity")
-    roe_pct = None if roe is None else float(roe) * 100
+        out = pd.DataFrame(results)
+        # enforce exact order
+        out = out[OUTPUT_COLUMNS]
 
-    roce_pct = compute_roce(financials, balance_sheet)
+        st.subheader("Results")
+        st.dataframe(
+            out.style.applymap(style_reco, subset=["Recommendation"]),
+            use_container_width=True,
+            hide_index=True
+        )
 
-    pb, fair, mos_buy, method_str = compute_valuation(
-        info=info,
-        sector=sector,
-        cfg=cfg,
-        sales_g_3y=sales_g3,
-        profit_g_3y=profit_g3,
-        roe_pct=roe_pct,
-        ltp=ltp,
-        mos_pct=mos,
-    )
+        # download
+        csv_bytes = out.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download results as CSV",
+            data=csv_bytes,
+            file_name=f"wealth_architect_results_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+        )
 
-    momentum = compute_momentum(ltp, d50, d200)
-    reco, reason = final_reco(momentum, ltp, fair, mos_buy)
-
-    # Company name (Yahoo longName sometimes missing for NSE)
-    company = info.get("longName") or info.get("shortName") or sym.replace(".NS", "")
-    return {
-        "Company": company,
-        "LTP": None if ltp is None else round(ltp, 2),
-        "50DMA": None if d50 is None else round(d50, 2),
-        "150DMA": None if d150 is None else round(d150, 2),
-        "200DMA": None if d200 is None else round(d200, 2),
-        "Sales growth % (YOY-3 years)": None if sales_g3 is None else round(sales_g3, 2),
-        "Profit growth % (YOY 3years)": None if profit_g3 is None else round(profit_g3, 2),
-        "ROE": None if roe_pct is None else round(roe_pct, 2),
-        "ROCE": None if roce_pct is None else round(roce_pct, 2),
-        "VAL: PB": None if pb is None else round(pb, 2),
-        "VAL: Fair": None if fair is None else round(fair, 2),
-        "VAL: MoS Buy": None if mos_buy is None else round(mos_buy, 2),
-        "VAL: Method": method_str,
-        "Momentum": momentum,
-        "Recommendation": reco,
-        "Reason": reason + (
-            "" if (sales_g3 is not None or profit_g3 is not None) else " | Growth(3Y) not available on Yahoo"
-        ) + (
-            "" if roce_pct is not None else " | ROCE not available from statements"
-        ),
-    }
-
-# Run
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-    futures = []
-    for i, sym in enumerate(tickers):
-        futures.append(ex.submit(process_one, i, sym))
-
-    done = 0
-    total = len(futures)
-    for fut in as_completed(futures):
-        done += 1
-        progress.progress(done / total)
-        status.info(f"Processing… {done}/{total}")
-        try:
-            results.append(fut.result())
-        except Exception as e:
-            results.append({
-                "Company": "UNKNOWN",
-                "LTP": None, "50DMA": None, "150DMA": None, "200DMA": None,
-                "Sales growth % (YOY-3 years)": None,
-                "Profit growth % (YOY 3years)": None,
-                "ROE": None, "ROCE": None,
-                "VAL: PB": None, "VAL: Fair": None, "VAL: MoS Buy": None,
-                "VAL: Method": "Error",
-                "Momentum": "Neutral",
-                "Recommendation": "Hold",
-                "Reason": f"Error fetching data: {e}",
-            })
-
-status.empty()
-
-# Order columns EXACTLY as you requested
-res_df = pd.DataFrame(results)
-for c in OUTPUT_COLUMNS:
-    if c not in res_df.columns:
-        res_df[c] = None
-res_df = res_df[OUTPUT_COLUMNS]
-
-# --------- Render with grouped headers like your screenshot (HTML table) ----------
-# Streamlit doesn't support merged header cells in st.dataframe, so we render HTML from pandas Styler.
-top = [
-    "", "Technicals", "Technicals", "Technicals",
-    "Fundamentals", "Fundamentals", "Fundamentals", "Fundamentals", "Fundamentals",
-    "Valuation", "Valuation", "Valuation", "Valuation",
-    "Final", "Final", "Final"
-]
-bottom = OUTPUT_COLUMNS
-
-multi_cols = pd.MultiIndex.from_arrays([top, bottom])
-display_df = res_df.copy()
-display_df.columns = multi_cols
-
-st.subheader("Results")
-styler = display_df.style.set_table_styles([
-    {"selector": "th", "props": [("background-color", "#e6f0ff"), ("color", "#000"), ("border", "1px solid #ddd"), ("text-align", "center")]},
-    {"selector": "td", "props": [("border", "1px solid #eee"), ("padding", "6px 8px")]},
-]).set_properties(**{"text-align": "left"})
-
-st.markdown(styler.to_html(), unsafe_allow_html=True)
-
-# Download
-csv_bytes = res_df.to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Download CSV", data=csv_bytes, file_name="wealth_architect_results.csv", mime="text/csv")
+        st.caption("Notes: Yahoo Finance data for NSE fundamentals can be incomplete. This app shows NA instead of guessing.")
+else:
+    st.info("Upload a CSV/XLSX with at least a ticker column (e.g., 'stock symbol'). Example tickers: INFY, TCS, RELIANCE (app auto-adds .NS).")
