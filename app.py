@@ -20,30 +20,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🏛️ Wealth Architect Pro")
-st.caption("NSE Portfolio Audit | Version 2.4 (Fixed KeyError & Display)")
+st.caption("NSE Portfolio Audit | Version 2.5 (Stable & Rate-Limit Optimized)")
 
-# --- UNIFIED COLUMN NAMES (The Source of Truth) ---
-C_COMP = "Company"
-C_LTP = "LTP"
-C_50 = "50DMA"
-C_150 = "150DMA"
-C_200 = "200DMA"
-C_SALES = "Sales Growth %"
-C_PROFIT = "Profit Growth %"
-C_ROE = "ROE %"
-C_ROCE = "ROCE %"
-C_PB = "P/B Ratio"
-C_FAIR = "Fair Value"
-C_MOS = "MoS Buy Price"
-C_METH = "Method"
-C_MOM = "Momentum"
-C_REC = "Recommendation"
-C_REAS = "Reason"
+# --- UNIFIED COLUMN CONSTANTS ---
+C_COMP, C_LTP = "Company", "LTP"
+C_50, C_150, C_200 = "50DMA", "150DMA", "200DMA"
+C_SALES, C_PROFIT = "Sales Growth %", "Profit Growth %"
+C_ROE, C_ROCE = "ROE %", "ROCE %"
+C_PB, C_FAIR, C_MOS, C_METH = "P/B Ratio", "Fair Value", "MoS Buy Price", "Method"
+C_MOM, C_REC, C_REAS = "Momentum", "Recommendation", "Reason"
 
-# Group Names
 G_TECH, G_FUND, G_VAL, G_DEC, G_NONE = "Technicals", "Fundamentals", "Valuation", "Decision", ""
 
-# Mapping for the Table Headers
+ALL_COLS = [C_COMP, C_LTP, C_50, C_150, C_200, C_SALES, C_PROFIT, C_ROE, C_ROCE, C_PB, C_FAIR, C_MOS, C_METH, C_MOM, C_REC, C_REAS]
 DISPLAY_MAP = [
     (G_NONE, C_COMP), (G_NONE, C_LTP),
     (G_TECH, C_50), (G_TECH, C_150), (G_TECH, C_200),
@@ -72,40 +61,62 @@ def _cagr(a, b, years: float):
     if a is None or b is None or a <= 0 or b <= 0 or years <= 0: return None
     return (b / a) ** (1.0 / years) - 1.0
 
-def _sector_bucket(sector: str, industry: str) -> str:
-    text = f"{str(sector)} {str(industry)}".lower()
-    if any(k in text for k in ["bank", "nbfc", "financial"]): return "Financial"
-    if any(k in text for k in ["software", "technology", "it services"]): return "Technology"
-    return "Default"
-
 # =========================
-# DATA FETCHING
+# DATA FETCHING (Rate-Limit & NoneType Safe)
 # =========================
 def fetch_fundamentals_one(ticker: str):
+    time.sleep(0.5) # Anti-Rate Limit Pause
     t = yf.Ticker(ticker)
     info = t.info or {}
-    res = {"roe": _safe_float(info.get("returnOnEquity")), "pb": _safe_float(info.get("priceToBook")),
-           "eps": _safe_float(info.get("forwardEps")) or _safe_float(info.get("trailingEps")),
-           "book": _safe_float(info.get("bookValue")), "s_3y": None, "p_3y": None, "roce": None,
-           "sect": info.get("sector"), "ind": info.get("industry")}
+    
+    res = {
+        "roe": _safe_float(info.get("returnOnEquity")), 
+        "pb": _safe_float(info.get("priceToBook")),
+        "eps": _safe_float(info.get("forwardEps")) or _safe_float(info.get("trailingEps")),
+        "book": _safe_float(info.get("bookValue")), 
+        "s_3y": None, "p_3y": None, "roce": None,
+        "sect": info.get("sector", "Default"), 
+        "ind": info.get("industry", "Default")
+    }
+
     try:
-        inc, bal = t.income_stmt, t.balance_sheet
-        if inc is not None and not inc.empty:
+        inc = t.income_stmt
+        bal = t.balance_sheet
+        
+        # Safe check for Financial Statements
+        if inc is not None and not inc.empty and isinstance(inc, pd.DataFrame):
             if "Total Revenue" in inc.index:
                 rev = inc.loc["Total Revenue"].dropna()
                 if len(rev) >= 2: res["s_3y"] = _cagr(rev.iloc[-1], rev.iloc[0], len(rev)-1)
+            
             if "Net Income" in inc.index:
                 ni = inc.loc["Net Income"].dropna()
                 if len(ni) >= 2: res["p_3y"] = _cagr(ni.iloc[-1], ni.iloc[0], len(ni)-1)
-            if bal is not None and not bal.empty and "EBIT" in inc.index and "Total Assets" in bal.index:
-                ebit, assets = inc.loc["EBIT"].iloc[0], bal.loc["Total Assets"].iloc[0]
-                liab = bal.loc["Current Liabilities"].iloc[0] if "Current Liabilities" in bal.index else 0
-                res["roce"] = (ebit / (assets - liab)) if (assets-liab)>0 else None
-    except: pass
+            
+            # Safe ROCE calculation
+            if bal is not None and not bal.empty and isinstance(bal, pd.DataFrame):
+                if "EBIT" in inc.index and "Total Assets" in bal.index:
+                    ebit = _safe_float(inc.loc["EBIT"].iloc[0])
+                    assets = _safe_float(bal.loc["Total Assets"].iloc[0])
+                    liab = _safe_float(bal.loc["Current Liabilities"].iloc[0]) if "Current Liabilities" in bal.index else 0
+                    
+                    if ebit is not None and assets is not None:
+                        cap_emp = assets - liab
+                        if cap_emp > 0: res["roce"] = ebit / cap_emp
+    except Exception:
+        pass # Silently skip errors for incomplete financial data
     return res
 
+# =========================
+# ANALYSIS LOGIC
+# =========================
 def run_valuation(f, ltp, mos_pct):
-    bucket = _sector_bucket(f["sect"], f["ind"])
+    sect, ind = f.get("sect", "Default"), f.get("ind", "Default")
+    text = f"{sect} {ind}".lower()
+    bucket = "Default"
+    if any(k in text for k in ["bank", "nbfc", "financial"]): bucket = "Financial"
+    elif any(k in text for k in ["software", "technology"]): bucket = "Technology"
+
     dcf = (f["eps"] * 3.7908) + (f["eps"] * 10 / (1.1**5)) if f["eps"] else None
     pb_v = (f["book"] * (f["roe"]/0.12)) if f["book"] and f["roe"] else None
     
@@ -126,16 +137,17 @@ def run_valuation(f, ltp, mos_pct):
 with st.sidebar:
     st.header("Settings")
     mos_in = st.slider("Margin of Safety %", 5, 40, 25)
-    work = st.slider("Threads", 1, 10, 4)
+    # REDUCED WORKERS TO PREVENT RATE LIMITING
+    work = st.slider("Threads (Keep low to avoid blocks)", 1, 4, 2)
 
-up = st.file_uploader("Upload CSV (Stock Symbol column required)", type=["csv"])
+up = st.file_uploader("Upload CSV", type=["csv"])
 
 if up:
     df_in = pd.read_csv(up)
     df_in.columns = [c.lower().strip() for c in df_in.columns]
     
     if "stock symbol" not in df_in.columns:
-        st.error("CSV must have a 'stock symbol' column.")
+        st.error("Missing 'stock symbol' column.")
     else:
         ticks = sorted(list(set([_clean_nse_symbol(x) for x in df_in["stock symbol"] if x])))
         if st.button("🚀 RUN AUDIT"):
@@ -143,12 +155,15 @@ if up:
             prog = st.progress(0)
             status = st.empty()
             
+            # 1. Batch fetch prices (More efficient)
             prices = yf.download(tickers=ticks, period="2y", group_by="ticker", progress=False)
 
+            # 2. Sequential/Parallel Fundamentals with Thread Management
             with ThreadPoolExecutor(max_workers=work) as exe:
                 futures = {exe.submit(fetch_fundamentals_one, t): t for t in ticks}
                 for i, fut in enumerate(as_completed(futures)):
                     t = futures[fut]
+                    status.text(f"Processing {i+1}/{len(ticks)}: {t}")
                     try:
                         f = fut.result()
                         ltp, d50, d150, d200 = (None,)*4
@@ -168,45 +183,27 @@ if up:
                             C_ROE: (f["roe"]*100 if f["roe"] else None), C_ROCE: (f["roce"]*100 if f["roce"] else None),
                             C_PB: pb, C_FAIR: fair, C_MOS: mos_p, C_METH: meth, C_MOM: mom, C_REC: rec, C_REAS: reas
                         })
-                    except Exception as e:
-                        st.warning(f"Error analyzing {t}: {e}")
+                    except Exception:
+                        pass 
                     prog.progress((i+1)/len(ticks))
             
-            # --- FIXED DISPLAY LOGIC ---
-            res_df = pd.DataFrame(results)
-            nums = res_df.select_dtypes(include=[np.number]).columns
-            res_df[nums] = res_df[nums].round(2)
-            res_df = res_df.fillna("NA")
+            status.empty()
+            if results:
+                res_df = pd.DataFrame(results)
+                nums = res_df.select_dtypes(include=[np.number]).columns
+                res_df[nums] = res_df[nums].round(2)
+                res_df = res_df.fillna("NA")
 
-            # Create flattened column names for display and styling
-            # This avoids the MultiIndex KeyError
-            flat_cols = []
-            for g, c in DISPLAY_MAP:
-                name = f"{g}: {c}" if g else c
-                flat_cols.append(name)
-            
-            # Reorder and rename
-            disp_df = res_df[[c for g, c in DISPLAY_MAP]].copy()
-            disp_df.columns = flat_cols
+                flat_cols = [f"{g}: {c}".strip(": ") if g else c for g, c in DISPLAY_MAP]
+                disp_df = res_df[[c for g, c in DISPLAY_MAP]].copy()
+                disp_df.columns = flat_cols
 
-            def style_fn(s):
-                rec_col = f"{G_DEC}: {C_REC}"
-                mos_col = f"{G_VAL}: {C_MOS}"
-                # Colors for Decision
-                s.applymap(lambda v: "background-color: #dcfce7; color: #166534; font-weight: bold;" if v=="Buy" else 
-                            ("background-color: #fee2e2; color: #991b1b; font-weight: bold;" if v=="Sell" else ""), 
-                            subset=[rec_col])
-                # Highlight MoS column
-                s.set_properties(**{'background-color': '#eff6ff', 'font-weight': 'bold'}, subset=[mos_col])
-                return s
+                def style_fn(s):
+                    s.applymap(lambda v: "background-color: #dcfce7; color: #166534; font-weight: bold;" if v=="Buy" else ("background-color: #fee2e2; color: #991b1b; font-weight: bold;" if v=="Sell" else ""), subset=[f"{G_DEC}: {C_REC}"])
+                    s.set_properties(**{'background-color': '#eff6ff', 'font-weight': 'bold'}, subset=[f"{G_VAL}: {C_MOS}"])
+                    return s
 
-            st.subheader("📊 Portfolio Audit Results")
-            st.dataframe(
-                style_fn(disp_df.style).format(precision=2),
-                use_container_width=True, hide_index=True,
-                column_config={
-                    f"{G_VAL}: {C_MOS}": st.column_config.NumberColumn("MoS Buy Price 🎯", help="Target entry price after safety margin"),
-                    f"{G_FUND}: {C_ROCE}": st.column_config.NumberColumn("ROCE %", help="Return on Capital Employed")
-                }
-            )
-            st.download_button("📥 Download Report", res_df.to_csv(index=False), "WealthAudit.csv")
+                st.dataframe(style_fn(disp_df.style).format(precision=2), use_container_width=True, hide_index=True)
+                st.download_button("📥 Download", res_df.to_csv(index=False), "Audit.csv")
+            else:
+                st.error("No data could be retrieved. Please wait 5 minutes and try again (Yahoo Rate Limit).")
