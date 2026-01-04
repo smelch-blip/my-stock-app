@@ -217,29 +217,41 @@ if uploaded:
             
             # Process & Style
             res_df = pd.DataFrame(results)
+            # 1. Process Data & Rounding
+            res_df = pd.DataFrame(results)
             num_cols = res_df.select_dtypes(include=[np.number]).columns
             res_df[num_cols] = res_df[num_cols].round(2)
             res_df = res_df.fillna("NA")
 
-            disp_df = pd.DataFrame(columns=DISPLAY_COLUMNS)
-            for (grp, col) in DISPLAY_COLUMNS: disp_df[(grp, col)] = res_df[col]
-
+            # 2. Flatten MultiIndex for Streamlit Compatibility
+            # We combine ('Valuation', 'MoS Buy Price') into 'Valuation: MoS Buy Price'
+            flat_cols = [f"{grp}: {col}".strip(": ") if grp else col for grp, col in DISPLAY_COLUMNS]
+            disp_df = pd.DataFrame(res_df[CSV_COLUMNS].values, columns=flat_cols)
+            
+            # 3. Updated Styling Function for Flattened Columns
             def style_audit(styler):
+                # Target the flattened column name 'Decision: Recommendation'
                 styler.applymap(lambda v: "background-color: #dcfce7; color: #166534; font-weight: bold;" if v=="Buy" else 
                                 ("background-color: #fee2e2; color: #991b1b; font-weight: bold;" if v=="Sell" else ""), 
-                                subset=[(GROUP_FINAL, COL_REC)])
-                styler.set_properties(**{'background-color': '#eff6ff', 'font-weight': 'bold'}, subset=[(GROUP_VAL, COL_VAL_MOS)])
+                                subset=[f"{GROUP_FINAL}: {COL_REC}"])
+                
+                # Target the flattened column name 'Valuation: MoS Buy Price'
+                styler.set_properties(**{'background-color': '#eff6ff', 'font-weight': 'bold'}, 
+                                     subset=[f"{GROUP_VAL}: {COL_VAL_MOS}"])
                 return styler
 
-            st.subheader("📊 Portfolio Report", help="ROCE: EBIT/(Total Assets-Current Liabilities). Momentum: Price relative to 50/150/200 DMA.")
+            st.subheader("📊 Portfolio Report")
             
-            col_a, col_b = st.columns(2)
-            with col_a:
-                with st.expander("ℹ️ Momentum Logic"):
-                    st.write("**Bullish:** Price > 50DMA > 150DMA > 200DMA. **Bearish:** Price < 200DMA.")
-            with col_b:
-                with st.expander("ℹ️ Valuation Weights"):
-                    st.write("**Financials:** 95% P/B. **Tech:** 85% DCF. **Others:** 50/50 Split.")
+            # 4. Final Dataframe Render with Flattened Keys
+            st.dataframe(
+                style_audit(disp_df.style).format(precision=2), 
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    f"{GROUP_VAL}: {COL_VAL_MOS}": st.column_config.NumberColumn("MoS Buy Price 🎯", help="Target entry price after Margin of Safety"),
+                    f"{GROUP_FUND}: {COL_ROCE}": st.column_config.NumberColumn("ROCE %", help="Capital efficiency indicator")
+                }
+            )
 
             st.dataframe(
                 style_audit(disp_df.style).format(precision=2), 
