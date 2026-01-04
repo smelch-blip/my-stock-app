@@ -20,9 +20,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🏛️ Wealth Architect Pro")
-st.caption("NSE Portfolio Audit | Version 2.3 (Fixed KeyError)")
+st.caption("NSE Portfolio Audit | Version 2.3 (Fixed KeyError & MultiIndex)")
 
-# --- UNIFIED COLUMN NAMES (To prevent KeyErrors) ---
+# --- UNIFIED COLUMN CONSTANTS ---
+# Use these variables everywhere to prevent KeyErrors
 C_COMP = "Company"
 C_LTP = "LTP"
 C_50 = "50DMA"
@@ -43,10 +44,10 @@ C_REAS = "Reason"
 # Groups for Display
 G_TECH, G_FUND, G_VAL, G_DEC, G_NONE = "Technicals", "Fundamentals", "Valuation", "Decision", ""
 
-# This list controls the order of data in the results list
+# Order of columns for the dataframe
 ALL_COLS = [C_COMP, C_LTP, C_50, C_150, C_200, C_SALES, C_PROFIT, C_ROE, C_ROCE, C_PB, C_FAIR, C_MOS, C_METH, C_MOM, C_REC, C_REAS]
 
-# This defines the flattened headers for Streamlit
+# Mapping for flattened headers
 DISPLAY_MAP = [
     (G_NONE, C_COMP), (G_NONE, C_LTP),
     (G_TECH, C_50), (G_TECH, C_150), (G_TECH, C_200),
@@ -82,7 +83,7 @@ def _sector_bucket(sector: str, industry: str) -> str:
     return "Default"
 
 # =========================
-# DATA FETCHING
+# DATA FETCHING (CAGR + ROCE)
 # =========================
 def fetch_fundamentals_one(ticker: str):
     t = yf.Ticker(ticker)
@@ -112,11 +113,21 @@ def fetch_fundamentals_one(ticker: str):
 # =========================
 def run_valuation(f, ltp, mos_pct):
     bucket = _sector_bucket(f["sect"], f["ind"])
+    # 3.79 Factor DCF
     dcf = (f["eps"] * 3.7908) + (f["eps"] * 10 / (1.1**5)) if f["eps"] else None
     pb_v = (f["book"] * (f["roe"]/0.12)) if f["book"] and f["roe"] else None
     
-    w = {"DCF": 0.05, "PB": 0.95} if bucket == "Financial" else ({"DCF": 0.85, "PB": 0.15} if bucket == "Technology" else {"DCF": 0.5, "PB": 0.5})
-    fair = (sum(v * w[k] for k, v in [("DCF", dcf), ("PB", pb_v)] if v) / sum(w[k] for k, v in [("DCF", dcf), ("PB", pb_v)] if v)) if (dcf or pb_v) else (ltp or 0)
+    # Sector Weights
+    if bucket == "Financial": w = {"DCF": 0.05, "PB": 0.95}
+    elif bucket == "Technology": w = {"DCF": 0.85, "PB": 0.15}
+    else: w = {"DCF": 0.5, "PB": 0.5}
+    
+    # Combine
+    vals = [v * w[k] for k, v in [("DCF", dcf), ("PB", pb_v)] if v]
+    weights = [w[k] for k, v in [("DCF", dcf), ("PB", pb_v)] if v]
+    fair = (sum(vals) / sum(weights)) if weights else (ltp or 0)
+    
+    # ROCE Premium
     if f["roce"] and f["roce"] > 0.22: fair *= 1.15
     return f["pb"], fair, fair * (1 - mos_pct/100), bucket
 
@@ -141,12 +152,16 @@ if up:
         if st.button("🚀 RUN AUDIT"):
             results = []
             prog = st.progress(0)
+            status = st.empty()
+            
+            status.info("Downloading historical prices...")
             prices = yf.download(tickers=ticks, period="2y", group_by="ticker", progress=False)
 
             with ThreadPoolExecutor(max_workers=work) as exe:
                 futures = {exe.submit(fetch_fundamentals_one, t): t for t in ticks}
                 for i, fut in enumerate(as_completed(futures)):
                     t = futures[fut]
+                    status.text(f"Analyzing {i+1}/{len(ticks)}: {t}")
                     try:
                         f = fut.result()
                         ltp, d50, d150, d200 = (None,)*4
@@ -166,32 +181,57 @@ if up:
                             C_ROE: (f["roe"]*100 if f["roe"] else None), C_ROCE: (f["roce"]*100 if f["roce"] else None),
                             C_PB: pb, C_FAIR: fair, C_MOS: mos_p, C_METH: meth, C_MOM: mom, C_REC: rec, C_REAS: reas
                         })
-                    except: pass
+                    except Exception as e:
+                        st.warning(f"Failed {t}: {e}")
                     prog.progress((i+1)/len(ticks))
             
-            # --- DISPLAY LOGIC (The Fixed Part) ---
+            status.empty()
+            
+            # --- DISPLAY LOGIC (FIXED) ---
             res_df = pd.DataFrame(results)
+            # Ensure 2 decimal rounding
             nums = res_df.select_dtypes(include=[np.number]).columns
             res_df[nums] = res_df[nums].round(2)
             res_df = res_df.fillna("NA")
 
-            # Flatten headers for Streamlit JSON compatibility
+            # Flatten headers for Streamlit JSON and MultiIndex styling
+            # Result: "Valuation: MoS Buy Price"
             disp_cols = [f"{g}: {c}".strip(": ") if g else c for g, c in DISPLAY_MAP]
+            
+            # We explicitly slice the dataframe by our unified column list to prevent KeyErrors
             disp_df = res_df[ALL_COLS].copy()
             disp_df.columns = disp_cols
 
             def style_fn(s):
-                s.applymap(lambda v: "background-color: #dcfce7; color: #166534; font-weight: bold;" if v=="Buy" else ("background-color: #fee2e2; color: #991b1b; font-weight: bold;" if v=="Sell" else ""), subset=[f"{G_DEC}: {C_REC}"])
-                s.set_properties(**{'background-color': '#eff6ff', 'font-weight': 'bold'}, subset=[f"{G_VAL}: {C_MOS}"])
+                # Recommendation Colors
+                rec_col = f"{G_DEC}: {C_REC}"
+                s.applymap(lambda v: "background-color: #dcfce7; color: #166534; font-weight: bold;" if v=="Buy" else 
+                            ("background-color: #fee2e2; color: #991b1b; font-weight: bold;" if v=="Sell" else ""), 
+                            subset=[rec_col])
+                # MoS Column (Blue)
+                mos_col = f"{G_VAL}: {C_MOS}"
+                s.set_properties(**{'background-color': '#eff6ff', 'font-weight': 'bold'}, subset=[mos_col])
                 return s
 
-            st.subheader("📊 Portfolio Audit")
+            st.subheader("📊 Portfolio Audit Results", help="ROCE is manually calculated: EBIT / (Assets - Current Liabilities).")
+            
+            # Use Expanders for Logic Documentation
+            col_l, col_r = st.columns(2)
+            with col_l:
+                with st.expander("ℹ️ Momentum Logic"):
+                    st.write("**Bullish:** Price > 50DMA > 150DMA > 200DMA. **Bearish:** Price < 200DMA.")
+            with col_r:
+                with st.expander("ℹ️ Valuation Weights"):
+                    st.write("**Financials:** 95% P/B. **Tech:** 85% DCF. **Others:** 50/50 Split.")
+
             st.dataframe(
                 style_fn(disp_df.style).format(precision=2),
                 use_container_width=True, hide_index=True,
                 column_config={
-                    f"{G_VAL}: {C_MOS}": st.column_config.NumberColumn(format="%.2f", help="Target entry price"),
-                    f"{G_FUND}: {C_ROCE}": st.column_config.NumberColumn(help="Capital Efficiency")
+                    f"{G_VAL}: {C_MOS}": st.column_config.NumberColumn("MoS Buy Price 🎯", help="Your target entry price"),
+                    f"{G_FUND}: {C_ROCE}": st.column_config.NumberColumn("ROCE %", help="Capital Efficiency")
                 }
             )
-            st.download_button("📥 Download", res_df.to_csv(index=False), "Audit.csv")
+            
+            csv = res_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Full Audit CSV", csv, "Audit_Results.csv", "text/csv")
