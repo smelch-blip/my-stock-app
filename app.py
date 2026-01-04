@@ -11,37 +11,49 @@ from datetime import datetime
 # =========================
 st.set_page_config(layout="wide", page_title="Wealth Architect Pro (NSE)")
 
-# Custom Styling
 st.markdown("""
 <style>
     .stApp { background-color: #ffffff; color: #000000; }
     section[data-testid="stSidebar"] { background-color: #f8f9fa !important; border-right: 1px solid #dddddd; }
     .stButton>button { background-color: #1d4ed8 !important; color: white !important; width: 100%; height: 3em; border-radius: 8px; }
-    .small-note { color:#6b7280; font-size: 0.85rem; margin-top: -10px; margin-bottom: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🏛️ Wealth Architect Pro")
-st.caption("NSE Portfolio Audit | Sector-Weighted Intelligence | ROCE & MoS Enabled")
+st.caption("NSE Portfolio Audit | Version 2.3 (Fixed KeyError)")
 
-# Column Definitions
-COL_COMPANY, COL_LTP = "Company", "LTP"
-COL_50, COL_150, COL_200 = "50DMA", "150DMA", "200DMA"
-COL_SALES_3Y, COL_PROFIT_3Y = "Sales Growth %", "Profit Growth %"
-COL_ROE, COL_ROCE = "ROE %", "ROCE %"
-COL_VAL_PB, COL_VAL_FAIR, COL_VAL_MOS, COL_VAL_METHOD = "P/B Ratio", "Fair Value", "MoS Buy Price", "Method"
-COL_MOM, COL_REC, COL_REASON = "Momentum", "Recommendation", "Reason"
+# --- UNIFIED COLUMN NAMES (To prevent KeyErrors) ---
+C_COMP = "Company"
+C_LTP = "LTP"
+C_50 = "50DMA"
+C_150 = "150DMA"
+C_200 = "200DMA"
+C_SALES = "Sales Growth %"
+C_PROFIT = "Profit Growth %"
+C_ROE = "ROE %"
+C_ROCE = "ROCE %"
+C_PB = "P/B Ratio"
+C_FAIR = "Fair Value"
+C_MOS = "MoS Buy Price"
+C_METH = "Method"
+C_MOM = "Momentum"
+C_REC = "Recommendation"
+C_REAS = "Reason"
 
-GROUP_TECH, GROUP_FUND, GROUP_VAL, GROUP_FINAL, GROUP_LEFT = "Technicals", "Fundamentals", "Valuation", "Decision", ""
+# Groups for Display
+G_TECH, G_FUND, G_VAL, G_DEC, G_NONE = "Technicals", "Fundamentals", "Valuation", "Decision", ""
 
-# MultiIndex Setup for display
-DISPLAY_COLUMNS = pd.MultiIndex.from_tuples([
-    (GROUP_LEFT, COL_COMPANY), (GROUP_LEFT, COL_LTP),
-    (GROUP_TECH, COL_50), (GROUP_TECH, COL_150), (GROUP_TECH, COL_200),
-    (GROUP_FUND, COL_SALES_3Y), (GROUP_FUND, COL_PROFIT_3Y), (GROUP_FUND, COL_ROE), (GROUP_FUND, COL_ROCE),
-    (GROUP_VAL, COL_VAL_PB), (GROUP_VAL, COL_VAL_FAIR), (GROUP_VAL, COL_VAL_MOS), (GROUP_VAL, COL_VAL_METHOD),
-    (GROUP_FINAL, COL_MOM), (GROUP_FINAL, COL_REC), (GROUP_FINAL, COL_REASON)
-])
+# This list controls the order of data in the results list
+ALL_COLS = [C_COMP, C_LTP, C_50, C_150, C_200, C_SALES, C_PROFIT, C_ROE, C_ROCE, C_PB, C_FAIR, C_MOS, C_METH, C_MOM, C_REC, C_REAS]
+
+# This defines the flattened headers for Streamlit
+DISPLAY_MAP = [
+    (G_NONE, C_COMP), (G_NONE, C_LTP),
+    (G_TECH, C_50), (G_TECH, C_150), (G_TECH, C_200),
+    (G_FUND, C_SALES), (G_FUND, C_PROFIT), (G_FUND, C_ROE), (G_FUND, C_ROCE),
+    (G_VAL, C_PB), (G_VAL, C_FAIR), (G_VAL, C_MOS), (G_VAL, C_METH),
+    (G_DEC, C_MOM), (G_DEC, C_REC), (G_DEC, C_REAS)
+]
 
 # =========================
 # HELPERS
@@ -65,200 +77,121 @@ def _cagr(a, b, years: float):
 
 def _sector_bucket(sector: str, industry: str) -> str:
     text = f"{str(sector)} {str(industry)}".lower()
-    if any(k in text for k in ["bank", "nbfc", "insurance", "financial"]): return "Financial"
-    if any(k in text for k in ["software", "it services", "technology"]): return "Technology"
-    if any(k in text for k in ["fmcg", "retail", "consumer", "food"]): return "Consumer"
-    if any(k in text for k in ["auto", "automobile"]): return "Auto"
+    if any(k in text for k in ["bank", "nbfc", "financial"]): return "Financial"
+    if any(k in text for k in ["software", "technology", "it services"]): return "Technology"
     return "Default"
 
 # =========================
-# DATA FETCHING (CAGR + ROCE)
+# DATA FETCHING
 # =========================
 def fetch_fundamentals_one(ticker: str):
     t = yf.Ticker(ticker)
     info = t.info or {}
-    res = {
-        "sector": info.get("sector"), "industry": info.get("industry"),
-        "roe": _safe_float(info.get("returnOnEquity")),
-        "pb": _safe_float(info.get("priceToBook")),
-        "eps": _safe_float(info.get("forwardEps")) or _safe_float(info.get("trailingEps")),
-        "book_value": _safe_float(info.get("bookValue")),
-        "sales_3y": None, "profit_3y": None, "roce": None
-    }
+    res = {"roe": _safe_float(info.get("returnOnEquity")), "pb": _safe_float(info.get("priceToBook")),
+           "eps": _safe_float(info.get("forwardEps")) or _safe_float(info.get("trailingEps")),
+           "book": _safe_float(info.get("bookValue")), "s_3y": None, "p_3y": None, "roce": None,
+           "sect": info.get("sector"), "ind": info.get("industry")}
     try:
-        inc = t.income_stmt
-        bal = t.balance_sheet
+        inc, bal = t.income_stmt, t.balance_sheet
         if inc is not None and not inc.empty:
             if "Total Revenue" in inc.index:
                 rev = inc.loc["Total Revenue"].dropna()
-                if len(rev) >= 2: res["sales_3y"] = _cagr(rev.iloc[-1], rev.iloc[0], len(rev)-1)
+                if len(rev) >= 2: res["s_3y"] = _cagr(rev.iloc[-1], rev.iloc[0], len(rev)-1)
             if "Net Income" in inc.index:
                 ni = inc.loc["Net Income"].dropna()
-                if len(ni) >= 2: res["profit_3y"] = _cagr(ni.iloc[-1], ni.iloc[0], len(ni)-1)
-            
-            # ROCE Calculation
-            if bal is not None and not bal.empty:
-                ebit = inc.loc["EBIT"].iloc[0] if "EBIT" in inc.index else None
-                assets = bal.loc["Total Assets"].iloc[0] if "Total Assets" in bal.index else None
+                if len(ni) >= 2: res["p_3y"] = _cagr(ni.iloc[-1], ni.iloc[0], len(ni)-1)
+            if bal is not None and not bal.empty and "EBIT" in inc.index and "Total Assets" in bal.index:
+                ebit, assets = inc.loc["EBIT"].iloc[0], bal.loc["Total Assets"].iloc[0]
                 liab = bal.loc["Current Liabilities"].iloc[0] if "Current Liabilities" in bal.index else 0
-                if ebit and assets:
-                    res["roce"] = (ebit / (assets - liab))
+                res["roce"] = (ebit / (assets - liab)) if (assets-liab)>0 else None
     except: pass
     return res
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_prices_batch(tickers: list):
-    try:
-        return yf.download(tickers=tickers, period="2y", interval="1d", group_by="ticker", auto_adjust=False, threads=True, progress=False)
-    except: return None
-
 # =========================
-# VALUATION ENGINE
+# ANALYSIS LOGIC
 # =========================
-def run_valuation_engine(fund, ltp, mos_pct):
-    sector = fund.get("sector", "")
-    bucket = _sector_bucket(sector, fund.get("industry", ""))
-    roce = fund.get("roce", 0)
+def run_valuation(f, ltp, mos_pct):
+    bucket = _sector_bucket(f["sect"], f["ind"])
+    dcf = (f["eps"] * 3.7908) + (f["eps"] * 10 / (1.1**5)) if f["eps"] else None
+    pb_v = (f["book"] * (f["roe"]/0.12)) if f["book"] and f["roe"] else None
     
-    # 1. DCF Model (3.79 Factor + Terminal)
-    dcf_val = None
-    if fund["eps"]:
-        dcf_val = (fund["eps"] * 3.7908) + (fund["eps"] * 10 / (1.1**5))
-        
-    # 2. P/B Graham Model
-    pb_val = (fund["book_value"] * (fund["roe"]/0.12)) if fund["book_value"] and fund["roe"] else None
-
-    # 3. Industry Specific Weighting
-    if bucket == "Financial":
-        weights = {"DCF": 0.05, "PB": 0.95}
-    elif bucket == "Technology":
-        weights = {"DCF": 0.85, "PB": 0.15}
-    else:
-        weights = {"DCF": 0.50, "PB": 0.50}
-    
-    # Quality Premium for High ROCE (>22%)
-    quality_mult = 1.15 if (roce and roce > 0.22) else 1.0
-    
-    vals, w_sum = [], 0
-    if dcf_val: 
-        vals.append(dcf_val * weights["DCF"]); w_sum += weights["DCF"]
-    if pb_val: 
-        vals.append(pb_val * weights["PB"]); w_sum += weights["PB"]
-        
-    fair = ((sum(vals)/w_sum) if w_sum > 0 else (ltp or 0)) * quality_mult
-    mos_buy = fair * (1 - mos_pct/100) if fair else None
-    
-    return fund["pb"], fair, mos_buy, f"{bucket} Model"
+    w = {"DCF": 0.05, "PB": 0.95} if bucket == "Financial" else ({"DCF": 0.85, "PB": 0.15} if bucket == "Technology" else {"DCF": 0.5, "PB": 0.5})
+    fair = (sum(v * w[k] for k, v in [("DCF", dcf), ("PB", pb_v)] if v) / sum(w[k] for k, v in [("DCF", dcf), ("PB", pb_v)] if v)) if (dcf or pb_v) else (ltp or 0)
+    if f["roce"] and f["roce"] > 0.22: fair *= 1.15
+    return f["pb"], fair, fair * (1 - mos_pct/100), bucket
 
 # =========================
 # MAIN APP
 # =========================
 with st.sidebar:
-    st.header("Control Panel")
-    mos_input = st.slider("Margin of Safety %", 5, 40, 25)
-    workers = st.slider("Threads", 1, 10, 4)
-    st.info("Valuation shifts automatically based on industry (e.g., P/B for Banks).")
+    st.header("Settings")
+    mos_in = st.slider("Margin of Safety %", 5, 40, 25)
+    work = st.slider("Threads", 1, 10, 4)
 
-uploaded = st.file_uploader("Upload Portfolio CSV", type=["csv"])
+up = st.file_uploader("Upload CSV (Stock Symbol column required)", type=["csv"])
 
-if uploaded:
-    df = pd.read_csv(uploaded)
-    df.columns = [c.lower().strip() for c in df.columns]
+if up:
+    df_in = pd.read_csv(up)
+    df_in.columns = [c.lower().strip() for c in df_in.columns]
     
-    if "stock symbol" not in df.columns:
-        st.error("Missing 'Stock Symbol' column.")
+    if "stock symbol" not in df_in.columns:
+        st.error("CSV must have a 'stock symbol' column.")
     else:
-        tickers = sorted(list(set([_clean_nse_symbol(x) for x in df["stock symbol"] if x])))
-        
-        if st.button("🚀 EXECUTE AUDIT"):
+        ticks = sorted(list(set([_clean_nse_symbol(x) for x in df_in["stock symbol"] if x])))
+        if st.button("🚀 RUN AUDIT"):
             results = []
-            progress = st.progress(0)
-            status = st.empty()
-            
-            batch_data = fetch_prices_batch(tickers)
-            
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                future_to_t = {executor.submit(fetch_fundamentals_one, t): t for t in tickers}
-                for i, future in enumerate(as_completed(future_to_t)):
-                    t = future_to_t[future]
+            prog = st.progress(0)
+            prices = yf.download(tickers=ticks, period="2y", group_by="ticker", progress=False)
+
+            with ThreadPoolExecutor(max_workers=work) as exe:
+                futures = {exe.submit(fetch_fundamentals_one, t): t for t in ticks}
+                for i, fut in enumerate(as_completed(futures)):
+                    t = futures[fut]
                     try:
-                        f = future.result()
-                        # Technicals
+                        f = fut.result()
                         ltp, d50, d150, d200 = (None,)*4
                         try:
-                            series = batch_data[t]['Close'].dropna() if len(tickers)>1 else batch_data['Close'].dropna()
-                            if len(series) > 200:
-                                ltp, d50, d150, d200 = series.iloc[-1], series.rolling(50).mean().iloc[-1], series.rolling(150).mean().iloc[-1], series.rolling(200).mean().iloc[-1]
+                            s = prices[t]['Close'].dropna() if len(ticks)>1 else prices['Close'].dropna()
+                            if len(s) > 200:
+                                ltp, d50, d150, d200 = s.iloc[-1], s.rolling(50).mean().iloc[-1], s.rolling(150).mean().iloc[-1], s.rolling(200).mean().iloc[-1]
                         except: pass
                         
-                        pb, fair, mos_buy, v_meth = run_valuation_engine(f, ltp, mos_input)
-                        
-                        mom = "Neutral"
-                        if ltp and d50 and d200:
-                            if ltp > d50 > d200: mom = "Bullish"
-                            elif ltp < d200: mom = "Bearish"
-                        
-                        reco, reason = "Hold", "Fairly Valued"
-                        if ltp and mos_buy and ltp <= mos_buy: reco, reason = "Buy", "Undervalued"
-                        elif ltp and fair and ltp > fair * 1.4: reco, reason = "Sell", "Expensive"
+                        pb, fair, mos_p, meth = run_valuation(f, ltp, mos_in)
+                        mom = "Bullish" if (ltp and d50 and d200 and ltp > d50 > d200) else ("Bearish" if (ltp and d200 and ltp < d200) else "Neutral")
+                        rec, reas = ("Buy", "Undervalued") if (ltp and mos_p and ltp <= mos_p) else (("Sell", "Overvalued") if (ltp and fair and ltp > fair * 1.4) else ("Hold", "Fair Value"))
 
                         results.append({
-                            COL_COMPANY: t.split(".")[0], COL_LTP: ltp,
-                            COL_50: d50, COL_150: d150, COL_200: d200,
-                            COL_SALES_3Y: (f["sales_3y"]*100 if f["sales_3y"] else None),
-                            COL_PROFIT_3Y: (f["profit_3y"]*100 if f["profit_3y"] else None),
-                            COL_ROE: (f["roe"]*100 if f["roe"] else None),
-                            COL_ROCE: (f["roce"]*100 if f["roce"] else None),
-                            COL_VAL_PB: pb, COL_VAL_FAIR: fair, COL_VAL_MOS: mos_buy, COL_VAL_METHOD: v_meth,
-                            COL_MOM: mom, COL_REC: reco, COL_REASON: reason
+                            C_COMP: t.split(".")[0], C_LTP: ltp, C_50: d50, C_150: d150, C_200: d200,
+                            C_SALES: (f["s_3y"]*100 if f["s_3y"] else None), C_PROFIT: (f["p_3y"]*100 if f["p_3y"] else None),
+                            C_ROE: (f["roe"]*100 if f["roe"] else None), C_ROCE: (f["roce"]*100 if f["roce"] else None),
+                            C_PB: pb, C_FAIR: fair, C_MOS: mos_p, C_METH: meth, C_MOM: mom, C_REC: rec, C_REAS: reas
                         })
                     except: pass
-                    progress.progress((i+1)/len(tickers))
+                    prog.progress((i+1)/len(ticks))
             
-            # Process & Style
+            # --- DISPLAY LOGIC (The Fixed Part) ---
             res_df = pd.DataFrame(results)
-            # 1. Process Data & Rounding
-            res_df = pd.DataFrame(results)
-            num_cols = res_df.select_dtypes(include=[np.number]).columns
-            res_df[num_cols] = res_df[num_cols].round(2)
+            nums = res_df.select_dtypes(include=[np.number]).columns
+            res_df[nums] = res_df[nums].round(2)
             res_df = res_df.fillna("NA")
 
-            # 2. Flatten MultiIndex for Streamlit Compatibility
-            # We combine ('Valuation', 'MoS Buy Price') into 'Valuation: MoS Buy Price'
-            flat_cols = [f"{grp}: {col}".strip(": ") if grp else col for grp, col in DISPLAY_COLUMNS]
-            disp_df = pd.DataFrame(res_df[CSV_COLUMNS].values, columns=flat_cols)
-            
-            # 3. Updated Styling Function for Flattened Columns
-            def style_audit(styler):
-                # Target the flattened column name 'Decision: Recommendation'
-                styler.applymap(lambda v: "background-color: #dcfce7; color: #166534; font-weight: bold;" if v=="Buy" else 
-                                ("background-color: #fee2e2; color: #991b1b; font-weight: bold;" if v=="Sell" else ""), 
-                                subset=[f"{GROUP_FINAL}: {COL_REC}"])
-                
-                # Target the flattened column name 'Valuation: MoS Buy Price'
-                styler.set_properties(**{'background-color': '#eff6ff', 'font-weight': 'bold'}, 
-                                     subset=[f"{GROUP_VAL}: {COL_VAL_MOS}"])
-                return styler
+            # Flatten headers for Streamlit JSON compatibility
+            disp_cols = [f"{g}: {c}".strip(": ") if g else c for g, c in DISPLAY_MAP]
+            disp_df = res_df[ALL_COLS].copy()
+            disp_df.columns = disp_cols
 
-            st.subheader("📊 Portfolio Report")
-            
-            # 4. Final Dataframe Render with Flattened Keys
-            st.dataframe(
-                style_audit(disp_df.style).format(precision=2), 
-                use_container_width=True, 
-                hide_index=True,
-                column_config={
-                    f"{GROUP_VAL}: {COL_VAL_MOS}": st.column_config.NumberColumn("MoS Buy Price 🎯", help="Target entry price after Margin of Safety"),
-                    f"{GROUP_FUND}: {COL_ROCE}": st.column_config.NumberColumn("ROCE %", help="Capital efficiency indicator")
-                }
-            )
+            def style_fn(s):
+                s.applymap(lambda v: "background-color: #dcfce7; color: #166534; font-weight: bold;" if v=="Buy" else ("background-color: #fee2e2; color: #991b1b; font-weight: bold;" if v=="Sell" else ""), subset=[f"{G_DEC}: {C_REC}"])
+                s.set_properties(**{'background-color': '#eff6ff', 'font-weight': 'bold'}, subset=[f"{G_VAL}: {C_MOS}"])
+                return s
 
+            st.subheader("📊 Portfolio Audit")
             st.dataframe(
-                style_audit(disp_df.style).format(precision=2), 
+                style_fn(disp_df.style).format(precision=2),
                 use_container_width=True, hide_index=True,
                 column_config={
-                    (GROUP_VAL, COL_VAL_MOS): st.column_config.NumberColumn("MoS Buy Price", help="Target entry price after Margin of Safety"),
-                    (GROUP_FUND, COL_ROCE): st.column_config.NumberColumn("ROCE %", help="Capital efficiency indicator")
+                    f"{G_VAL}: {C_MOS}": st.column_config.NumberColumn(format="%.2f", help="Target entry price"),
+                    f"{G_FUND}: {C_ROCE}": st.column_config.NumberColumn(help="Capital Efficiency")
                 }
             )
-            st.download_button("📥 Download Report", res_df.to_csv(index=False), "WealthAudit.csv", "text/csv")
+            st.download_button("📥 Download", res_df.to_csv(index=False), "Audit.csv")
