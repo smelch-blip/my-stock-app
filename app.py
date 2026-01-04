@@ -192,11 +192,9 @@ if uploaded:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # 1. Batch Prices
         status_text.info("Fetching price history...")
         batch_data = fetch_prices_batch(unique_tickers)
         
-        # 2. Fundamentals via ThreadPool
         results = []
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_t = {executor.submit(fetch_fundamentals_one, t): t for t in unique_tickers}
@@ -210,7 +208,6 @@ if uploaded:
                     mom = momentum_label(ltp, d50, d150, d200)
                     pb, fair, mos_buy, v_method = compute_valuation(fund, mos)
                     
-                    # Logic for Recommendation
                     reco, reason = "Hold", "Fairly valued"
                     if ltp and mos_buy and ltp <= mos_buy: reco, reason = "Buy", "Deep Discount"
                     elif ltp and fair and ltp > fair * 1.3: reco, reason = "Sell", "Significant Overvalue"
@@ -229,12 +226,44 @@ if uploaded:
                 progress_bar.progress((i + 1) / len(unique_tickers))
                 status_text.text(f"Analyzed {i+1}/{len(unique_tickers)}: {t}")
 
-        # 3. Display
-        res_df = pd.DataFrame(results).fillna("NA")
+        # =========================
+        # 3. DISPLAY & STYLING
+        # =========================
+        res_df = pd.DataFrame(results)
+
+        # A. ROUNDING: Apply 2 decimal rounding to all numeric columns
+        num_cols = res_df.select_dtypes(include=[np.number]).columns
+        res_df[num_cols] = res_df[num_cols].round(2)
+        res_df = res_df.fillna("NA")
+
+        # B. MULTI-INDEX PREP
         display_df = pd.DataFrame(columns=DISPLAY_COLUMNS)
-        for (grp, col) in DISPLAY_COLUMNS: display_df[(grp, col)] = res_df[col]
+        for (grp, col) in DISPLAY_COLUMNS: 
+            display_df[(grp, col)] = res_df[col]
         
+        # C. STYLING FUNCTION
+        def apply_audit_styles(styler):
+            # Recommendation colors
+            def color_reco(val):
+                if val == "Buy": return "background-color: #dcfce7; color: #166534; font-weight: bold;"
+                if val == "Sell": return "background-color: #fee2e2; color: #991b1b; font-weight: bold;"
+                return ""
+            
+            styler.applymap(color_reco, subset=[(GROUP_FINAL, COL_REC)])
+            
+            # MoS Buy Price Highlight (Blue)
+            styler.set_properties(**{'background-color': '#eff6ff', 'font-weight': 'bold'}, 
+                                 subset=[(GROUP_VAL, COL_VAL_MOS)])
+            return styler
+
         st.subheader("Analysis Results")
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        
+        # Render with precision 2 to ensure UI consistency
+        st.dataframe(
+            apply_audit_styles(display_df.style).format(precision=2), 
+            use_container_width=True, 
+            hide_index=True
+        )
+
         st.download_button("Download CSV", res_df.to_csv(index=False), "results.csv", "text/csv")
         status_text.success("Done!")
